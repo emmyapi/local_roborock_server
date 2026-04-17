@@ -86,29 +86,61 @@ Vacuum → local server (vacuum `192.168.10.110`) during the same window:
 **none**. The vacuum makes no HTTP request related to the camera session. Its
 TURN-server discovery path bypasses `api-roborock.mkb.dk` entirely.
 
-## The open question: where does the vacuum fetch its TURN config?
+## Where the vacuum fetches its TURN config (LAN-gateway capture, 2026-04-17)
 
-`-10014 "request turnserver failed"` fires ~130ms after
-`start_camera_preview` — too fast for a DNS timeout, consistent with a
-connection refused/cached-endpoint-unreachable. Candidate paths the vacuum might
-use to reach a TURN coordinator:
+Resolved via 45-second tcpdump on the LAN gateway (UniFi UDR, `br2`) filtered
+to the vacuum IP while a failed `start_camera_preview` fired. Full timeline
+below; raw pcap at `research/camera-2026-04-17/petmon.pcap` (gitignored).
 
-1. **Direct TCP/TLS** to a hardcoded Roborock IP (no DNS).
-2. **DNS to a non-`api-` hostname** that our intercept doesn't cover
-   (e.g. `iot.roborock.com`, `turn.roborock.com`, `srs-eu.roborock.com`).
-   Needs packet capture on the LAN gateway (MikroTik) to confirm.
-3. **A cached TURN endpoint** baked into firmware config from the last cloud
-   pairing, now unreachable because that endpoint's IP is firewalled.
-4. **A Roborock-specific discovery protocol** we haven't yet identified.
+**Two vacuum-initiated outbound flows, both camera-related:**
 
-To resolve: either (a) cloud reference capture — pair the vacuum to real
-Roborock cloud for one session, mitmproxy + tcpdump at the gateway, observe the
-full successful handshake — or (b) packet-capture on the MikroTik during a local
-failed-`start_camera_preview` attempt to see where the vacuum is dialing out.
+1. **`conf-eu-1316693915.cos.eu-frankfurt.myqcloud.com`** (Tencent Cloud
+   Frankfurt Object Storage, resolves to `43.158.112.41`). TLS handshake, ~8KB
+   payload down, vacuum closes. This fires *before* the TURN dial — almost
+   certainly a regional config JSON that tells the vacuum the TURN coordinator
+   hostname/URL. Hostname pattern matches Roborock's standard config-bucket
+   naming (`conf-<region>-<tencent-appid>`). Pinning-aware TLS, third-party
+   CDN — out of reach for passive inspection.
 
-Option (b) is much cheaper and sufficient to identify the endpoint hostname; it
-may or may not yield the response payload (depends on TLS). Option (a) is
-definitive.
+2. **`roborock.mkb.dkiot.roborock.com`** — **NXDomain.** This is the TURN
+   coordinator dial and the source of the `-10014 "request turnserver failed"`
+   error. The vacuum firmware builds the coordinator hostname with template
+   `%siot.roborock.com` and `%s` = the region/server substring it was
+   onboarded with. Our onboarding sets that substring to `roborock.mkb.dk`
+   (so `api-%s.roborock.com` becomes the URL
+   `api-roborock.mkb.dk/.roborock.com/region` — a valid DNS name for the
+   first label and a path from `/.roborock.com/...`). But the `%siot.` template
+   does **not** insert a dot before the rest, so `roborock.mkb.dk` + `iot.` =
+   `roborock.mkb.dkiot.roborock.com`, an invalid FQDN. Public DNS returns
+   NXDomain and the vacuum gives up within ~400ms.
+
+No other outbound connections from the vacuum during the window. No cached
+IPs, no hardcoded Roborock IPs — the TURN path *is* DNS-driven.
+
+### Fix path for Phase 2
+
+The upstream server already handles this hostname family. `shared/http_helpers.py`
+`classify_host()` returns `"iot"` for any host containing `iot.` — which
+matches `roborock.mkb.dkiot.roborock.com` via the `.dkiot.` substring. And
+`shared/constants.py DNS_OVERRIDES` lists `usiot/euiot/cniot/ruiot.roborock.com`
+as the *designed* redirect targets, meaning upstream expects a local DNS
+forwarder to map these to the server IP.
+
+Cheapest unblock:
+
+1. Add a DNS A-record override on the LAN gateway:
+   `roborock.mkb.dkiot.roborock.com` → `192.168.10.102`.
+2. Re-run `start_camera_preview` and packet-capture the HTTPS request the
+   vacuum then sends to our server on that host. That request (path + body)
+   defines the TURN-coordinator API we have to implement.
+3. Implement the coordinator endpoint returning our local coturn's URL +
+   credentials.
+
+Alternate (more invasive but closer to upstream's intended design): re-onboard
+with `eu` as the region substring, DNS-override the full
+`euiot.roborock.com` / `api-eu.roborock.com` / `mqtt-eu.roborock.com` family
+to `192.168.10.102`. Keeps Kenneth's fork on the same onboarding path upstream
+expects. Defer unless the single-record override proves insufficient.
 
 ## What upstream has and doesn't
 
@@ -137,32 +169,14 @@ fetch a TURN server; steps 2–4 never fired.
 
 ## What's unknown after this capture
 
-The single remaining unknown is **where the vacuum dials out to fetch the TURN
-config**. We've ruled out:
-
-- The MQTT broker we control — vacuum sent no `get_turn_server` or similar RPC
-  on `rr/d/i/...` (we grep'd the full 1364-line capture and scanned vacuum
-  outbound methods — zero RPC requests initiated by the device).
-- Our HTTPS API (`api-roborock.mkb.dk`) — vacuum's only hits during the window
-  were `time`, `region`, `location`, `nc`, and `devices/.../info`; none
-  camera-related.
-
-Remaining candidates (in rough order of likelihood):
-
-1. **DNS to a non-`api-` Roborock hostname** our Cloudflare intercept doesn't
-   cover — e.g. `euiot.roborock.com`, `mqtt-eu.roborock.com`, `i-eu.roborock.com`,
-   `turn.roborock.com`, `srs-eu.roborock.com`. These would resolve to real
-   Roborock IPs; the vacuum would try to authenticate there with its *local*
-   credentials and fail.
-2. **A cached IP** from the last cloud pairing, now firewalled.
-3. **A hardcoded IP** compiled into firmware.
-
-**To resolve**: packet capture on the MikroTik during a failed
-`start_camera_preview` attempt. That's a one-shot, zero-setup-cost observation
-that tells us the hostname/IP the vacuum dials. The plan's Phase 0 step 2
-(full cloud reference capture via mitmproxy on am5gamingpc) is still the
-definitive move for getting the *successful* protocol bytes, but is much
-heavier and can wait.
+- **The HTTPS request shape on the TURN-coordinator host.** What path does the
+  vacuum `GET`/`POST`? What headers (probably Hawk-authed like the rest of the
+  API)? What response shape does it expect (TURN URL list? ICE server struct?
+  session token?). Resolved by the next capture iteration once DNS is
+  redirected to our server and the request actually reaches us.
+- **The Tencent COS config contents.** Third-party TLS, likely cert-pinned in
+  firmware. Not required if the TURN-coordinator request shape is clear from
+  our local server's inbound capture.
 
 ## Raw captures
 
@@ -170,5 +184,6 @@ heavier and can wait.
 - `research/camera-2026-04-17/http_capture.jsonl` — HTTPS slice (4 lines)
 - `research/camera-2026-04-17/mqtt_server_slice.log` — mqtt server log slice
 - `research/camera-2026-04-17/api_server_slice.log` — api server log slice
+- `research/camera-2026-04-17/petmon.pcap` — LAN-gateway tcpdump slice (987 pkts)
 - `research/camera-2026-04-17/capture-start.txt` — UTC start timestamp
 - `research/camera-2026-04-17/log-line-cutoffs.txt` — pre-tap line counts
