@@ -1,0 +1,10 @@
+   15686 /srv/appdata/roborock-local-server/data/runtime/decompiled_mqtt.jsonl
+     418 /srv/appdata/roborock-local-server/data/runtime/decompiled_http.jsonl
+   51891 /srv/appdata/roborock-local-server/data/runtime/mqtt_server.log
+       0 /srv/appdata/roborock-local-server/data/runtime/https_server.log
+   67995 total
+    0 /srv/appdata/roborock-local-server/data/runtime/iot_server.log
+    0 /srv/appdata/roborock-local-server/data/runtime/unknown_server.log
+  537 /srv/appdata/roborock-local-server/data/runtime/api_server.log
+    0 /srv/appdata/roborock-local-server/data/runtime/wood_server.log
+  537 total

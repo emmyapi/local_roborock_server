@@ -1,0 +1,5 @@
+# Raw captures contain device secrets (localKey, Hawk auth MACs, homesec
+# password MD5, home layout). Keep local only; do not publish.
+*.jsonl
+*.log
+*.pcap
