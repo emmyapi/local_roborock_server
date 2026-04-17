@@ -13,6 +13,7 @@ from pathlib import Path
 import secrets
 import signal
 import socket
+import ssl
 from typing import Any
 from urllib.parse import parse_qs
 
@@ -20,7 +21,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 import uvicorn
 
-from .certs import CertificateManager
+from .certs import CertificateManager, IOT_COORDINATOR_HOSTS
 from .bundled_backend.shared.data_helpers import utcnow_iso
 from .bundled_backend.shared.runtime_state import ONBOARDING_STEP_LABELS, REQUIRED_ONBOARDING_STEPS
 from .cloud import CloudImportManager
@@ -116,12 +117,16 @@ class ManagedFastApiServer:
         port: int,
         cert_file: Path,
         key_file: Path,
+        iot_cert_file: Path | None = None,
+        iot_key_file: Path | None = None,
     ) -> None:
         self._app = app
         self._bind_host = bind_host
         self._port = port
         self._cert_file = cert_file
         self._key_file = key_file
+        self._iot_cert_file = iot_cert_file
+        self._iot_key_file = iot_key_file
         self._server: uvicorn.Server | None = None
         self._serve_task: asyncio.Task[bool] | None = None
 
@@ -136,9 +141,36 @@ class ManagedFastApiServer:
             ssl_keyfile=str(self._key_file),
             ssl_ciphers="DEFAULT:@SECLEVEL=0",
         )
+        config.load()
+        if config.ssl is not None and self._iot_cert_file and self._iot_key_file:
+            self._install_iot_sni_callback(config.ssl)
         self._server = uvicorn.Server(config)
         self._serve_task = asyncio.create_task(self._server.serve(), name="release-https-server")
         await self._wait_started()
+
+    def _install_iot_sni_callback(self, primary_ctx: ssl.SSLContext) -> None:
+        iot_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        try:
+            iot_ctx.set_ciphers("DEFAULT:@SECLEVEL=0")
+        except ssl.SSLError:
+            pass
+        assert self._iot_cert_file is not None and self._iot_key_file is not None
+        iot_ctx.load_cert_chain(
+            certfile=str(self._iot_cert_file),
+            keyfile=str(self._iot_key_file),
+        )
+        iot_hosts = {host.lower() for host in IOT_COORDINATOR_HOSTS}
+
+        def sni_callback(
+            sslsocket: ssl.SSLObject,
+            server_name: str | None,
+            _ctx: ssl.SSLContext,
+        ) -> None:
+            if server_name and server_name.lower() in iot_hosts:
+                sslsocket.context = iot_ctx
+            return None
+
+        primary_ctx.sni_callback = sni_callback
 
     async def _wait_started(self) -> None:
         if self._server is None:
@@ -779,12 +811,15 @@ class ReleaseSupervisor:
 
     async def _start_http_server(self) -> None:
         cert_paths = self.certificate_manager.certificate_paths
+        iot_cert_paths = self.certificate_manager.iot_coordinator_certificate_paths
         self._http_server = ManagedFastApiServer(
             app=self.app,
             bind_host=self.config.network.bind_host,
             port=self.config.network.https_port,
             cert_file=cert_paths.cert_file,
             key_file=cert_paths.key_file,
+            iot_cert_file=iot_cert_paths.cert_file,
+            iot_key_file=iot_cert_paths.key_file,
         )
         await self._http_server.start()
         self.runtime_state.set_service("https_server", running=True, required=True, enabled=True)
@@ -836,6 +871,7 @@ class ReleaseSupervisor:
             path.mkdir(parents=True, exist_ok=True)
 
         self.certificate_manager.ensure_certificate()
+        self.certificate_manager.ensure_iot_coordinator_certificate()
         self.refresh_inventory_state()
 
         if self.config.broker.mode == "embedded":
