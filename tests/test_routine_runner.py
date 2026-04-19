@@ -13,7 +13,7 @@ from roborock_local_server.bundled_backend.shared.routine_runner import RoutineR
 from roborock.roborock_typing import RoborockCommand
 
 
-def _test_context(tmp_path: Path) -> ServerContext:
+def _test_context(tmp_path: Path, *, scene_completion_webhook_url: str = "") -> ServerContext:
     return ServerContext(
         api_host="api.example.com",
         mqtt_host="mqtt.example.com",
@@ -30,6 +30,7 @@ def _test_context(tmp_path: Path) -> ServerContext:
         http_jsonl=tmp_path / "http.jsonl",
         mqtt_jsonl=tmp_path / "mqtt.jsonl",
         loggers={"api": logging.getLogger("test-routine-runner")},
+        scene_completion_webhook_url=scene_completion_webhook_url,
     )
 
 
@@ -585,6 +586,180 @@ def test_wait_for_step_complete_no_resume_when_battery_low(monkeypatch) -> None:
         with pytest.raises(routine_runner_module.RoutineExecutionError, match="Timed out"):
             await client.wait_for_step_complete()
         assert len(client.sent_commands) == 0
+
+    asyncio.run(exercise())
+
+
+# ---------------------------------------------------------------------------
+# scene-completion webhook tests
+# ---------------------------------------------------------------------------
+
+
+def _drain_webhook_tasks() -> None:
+    """Yield control a few times so fire-and-forget webhook tasks can run to completion."""
+    # three turns is more than enough — the test POST helper doesn't await I/O.
+
+
+async def _run_on_scene_done(runner: RoutineRunner, *, device_id: str, scene_id: int, scene_name: str, outcome: str) -> None:
+    """Seed an active routine, then drive _on_scene_done with a task in the requested outcome."""
+    from roborock_local_server.bundled_backend.shared.routine_runner import _ActiveRoutine
+
+    loop = asyncio.get_running_loop()
+
+    if outcome == "success":
+        async def _body() -> None:
+            return None
+    elif outcome == "cancelled":
+        async def _body() -> None:
+            await asyncio.sleep(3600)
+    elif outcome == "exception":
+        async def _body() -> None:
+            raise RuntimeError("boom")
+    else:
+        raise ValueError(outcome)
+
+    task = loop.create_task(_body())
+    runner._tasks_by_device[device_id] = _ActiveRoutine(
+        task=task,
+        scene_id=scene_id,
+        scene_name=scene_name,
+    )
+    if outcome == "cancelled":
+        task.cancel()
+    try:
+        await task
+    except (asyncio.CancelledError, RuntimeError):
+        pass
+    runner._on_scene_done(device_id, task)
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+
+def test_scene_completion_webhook_posts_on_success(tmp_path: Path, monkeypatch) -> None:
+    async def exercise() -> None:
+        runner = RoutineRunner(
+            _test_context(tmp_path, scene_completion_webhook_url="http://ha.example/api/webhook/x")
+        )
+        captured: list[dict] = []
+
+        class _FakeResponse:
+            status = 200
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        class _FakeSession:
+            def __init__(self, *args, **kwargs) -> None:
+                _ = args, kwargs
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            def post(self, url, *, json):
+                captured.append({"url": url, "json": json})
+                return _FakeResponse()
+
+        monkeypatch.setattr(routine_runner_module.aiohttp, "ClientSession", _FakeSession)
+
+        await _run_on_scene_done(
+            runner,
+            device_id="device-1",
+            scene_id=4491073,
+            scene_name="Downstairs Vac+Mop",
+            outcome="success",
+        )
+
+        assert len(captured) == 1
+        assert captured[0]["url"] == "http://ha.example/api/webhook/x"
+        payload = captured[0]["json"]
+        assert payload["event"] == "scene_completed"
+        assert payload["sceneId"] == 4491073
+        assert payload["sceneName"] == "Downstairs Vac+Mop"
+        assert payload["deviceId"] == "device-1"
+        assert isinstance(payload["completedAt"], str)
+        assert payload["completedAt"].endswith("+00:00")
+
+    asyncio.run(exercise())
+
+
+def test_scene_completion_webhook_skips_on_cancellation(tmp_path: Path, monkeypatch) -> None:
+    async def exercise() -> None:
+        runner = RoutineRunner(
+            _test_context(tmp_path, scene_completion_webhook_url="http://ha.example/api/webhook/x")
+        )
+        captured: list[dict] = []
+
+        class _ShouldNotCall:
+            def __init__(self, *args, **kwargs) -> None:
+                captured.append({"called": True})
+
+        monkeypatch.setattr(routine_runner_module.aiohttp, "ClientSession", _ShouldNotCall)
+
+        await _run_on_scene_done(
+            runner,
+            device_id="device-1",
+            scene_id=4491073,
+            scene_name="Upstairs Vac+Mop",
+            outcome="cancelled",
+        )
+
+        assert captured == []
+
+    asyncio.run(exercise())
+
+
+def test_scene_completion_webhook_skips_on_exception(tmp_path: Path, monkeypatch) -> None:
+    async def exercise() -> None:
+        runner = RoutineRunner(
+            _test_context(tmp_path, scene_completion_webhook_url="http://ha.example/api/webhook/x")
+        )
+        captured: list[dict] = []
+
+        class _ShouldNotCall:
+            def __init__(self, *args, **kwargs) -> None:
+                captured.append({"called": True})
+
+        monkeypatch.setattr(routine_runner_module.aiohttp, "ClientSession", _ShouldNotCall)
+
+        await _run_on_scene_done(
+            runner,
+            device_id="device-1",
+            scene_id=4491073,
+            scene_name="Living Room Vac+Mop",
+            outcome="exception",
+        )
+
+        assert captured == []
+
+    asyncio.run(exercise())
+
+
+def test_scene_completion_webhook_skips_when_url_empty(tmp_path: Path, monkeypatch) -> None:
+    async def exercise() -> None:
+        runner = RoutineRunner(_test_context(tmp_path, scene_completion_webhook_url=""))
+        captured: list[dict] = []
+
+        class _ShouldNotCall:
+            def __init__(self, *args, **kwargs) -> None:
+                captured.append({"called": True})
+
+        monkeypatch.setattr(routine_runner_module.aiohttp, "ClientSession", _ShouldNotCall)
+
+        await _run_on_scene_done(
+            runner,
+            device_id="device-1",
+            scene_id=4491073,
+            scene_name="Bathroom Up Vac+Mop",
+            outcome="success",
+        )
+
+        assert captured == []
 
     asyncio.run(exercise())
 
