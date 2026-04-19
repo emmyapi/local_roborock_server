@@ -56,12 +56,18 @@ class AdminConfig:
 
 
 @dataclass(frozen=True)
+class HomeAssistantConfig:
+    scene_completion_webhook_url: str
+
+
+@dataclass(frozen=True)
 class AppConfig:
     network: NetworkConfig
     broker: BrokerConfig
     storage: StorageConfig
     tls: TlsConfig
     admin: AdminConfig
+    home_assistant: HomeAssistantConfig
 
 
 @dataclass(frozen=True)
@@ -127,6 +133,7 @@ def load_config(path: str | Path) -> AppConfig:
     storage = _get_section(parsed, "storage")
     tls = _get_section(parsed, "tls")
     admin = _get_section(parsed, "admin")
+    home_assistant = _get_section(parsed, "home_assistant")
     broker_mode = str(broker.get("mode", "embedded")).strip().lower()
     if broker_mode not in {"embedded", "external"}:
         raise ValueError("broker.mode must be 'embedded' or 'external'")
@@ -179,6 +186,9 @@ def load_config(path: str | Path) -> AppConfig:
             password_hash=_require_non_empty(admin.get("password_hash"), "admin.password_hash"),
             session_secret=_require_non_empty(admin.get("session_secret"), "admin.session_secret"),
             session_ttl_seconds=_as_int(admin.get("session_ttl_seconds"), "admin.session_ttl_seconds", 86400),
+        ),
+        home_assistant=HomeAssistantConfig(
+            scene_completion_webhook_url=str(home_assistant.get("scene_completion_webhook_url", "")).strip(),
         ),
     )
 

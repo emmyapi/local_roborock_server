@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import json
 import logging
 from pathlib import Path
 import secrets
 import sys
 from typing import Any
+
+import aiohttp
 
 
 def _ensure_local_python_roborock_on_path() -> None:
@@ -746,6 +749,8 @@ class RoutineRunner:
 
     def _on_scene_done(self, device_id: str, task: asyncio.Task[None]) -> None:
         current = self._tasks_by_device.get(device_id)
+        scene_id = current.scene_id if current is not None else 0
+        scene_name = current.scene_name if current is not None else ""
         if current is not None and current.task is task:
             self._tasks_by_device.pop(device_id, None)
         if task.cancelled():
@@ -761,6 +766,82 @@ class RoutineRunner:
         exc = task.exception()
         if exc is not None:
             self._logger.error("Routine task failed for device=%s: %s", device_id, exc)
+            return
+        if not self._context.scene_completion_webhook_url:
+            return
+        webhook_task = asyncio.get_running_loop().create_task(
+            self._post_scene_webhook(
+                device_id=device_id,
+                scene_id=scene_id,
+                scene_name=scene_name,
+            ),
+            name=f"routine-webhook-{scene_id}-{device_id}",
+        )
+        webhook_task.add_done_callback(
+            lambda finished: self._on_webhook_done(
+                device_id=device_id,
+                scene_id=scene_id,
+                task=finished,
+            )
+        )
+
+    async def _post_scene_webhook(
+        self,
+        *,
+        device_id: str,
+        scene_id: int,
+        scene_name: str,
+    ) -> None:
+        url = self._context.scene_completion_webhook_url
+        payload = {
+            "event": "scene_completed",
+            "sceneId": scene_id,
+            "sceneName": scene_name,
+            "deviceId": device_id,
+            "completedAt": datetime.now(timezone.utc).isoformat(),
+        }
+        try:
+            timeout = aiohttp.ClientTimeout(total=15)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(url, json=payload) as response:
+                    if response.status >= 400:
+                        self._logger.warning(
+                            "Scene completion webhook returned HTTP %s for scene=%s device=%s",
+                            response.status,
+                            scene_name,
+                            device_id,
+                        )
+                    else:
+                        self._logger.info(
+                            "Scene completion webhook posted scene=%s device=%s status=%s",
+                            scene_name,
+                            device_id,
+                            response.status,
+                        )
+        except Exception as exc:  # noqa: BLE001 — best-effort webhook
+            self._logger.warning(
+                "Scene completion webhook failed scene=%s device=%s: %s",
+                scene_name,
+                device_id,
+                exc,
+            )
+
+    def _on_webhook_done(self, *, device_id: str, scene_id: int, task: asyncio.Task[None]) -> None:
+        if task.cancelled():
+            self._logger.warning(
+                "Scene completion webhook task cancelled for device=%s scene=%s",
+                device_id,
+                scene_id,
+            )
+            return
+        exc = task.exception()
+        if exc is not None:
+            self._logger.error(
+                "Scene completion webhook task failed for device=%s scene=%s: %s",
+                device_id,
+                scene_id,
+                exc,
+            )
 
     def _on_stop_done(self, *, device_id: str, scene_id: int, task: asyncio.Task[None]) -> None:
         if task.cancelled():

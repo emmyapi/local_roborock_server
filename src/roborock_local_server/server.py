@@ -379,6 +379,7 @@ class ReleaseSupervisor:
             runtime_state=self.runtime_state,
             runtime_credentials=self.runtime_credentials,
             zone_ranges_store=self._init_zone_ranges_store(),
+            scene_completion_webhook_url=self.config.home_assistant.scene_completion_webhook_url,
         )
         self.endpoint_rules = default_endpoint_rules()
         self.app = self._create_app()
