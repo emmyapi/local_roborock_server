@@ -255,11 +255,31 @@ def test_run_scene_syncs_scene_tids_before_step_commands(tmp_path: Path, monkeyp
             RoborockCommand.REUNION_SCENES,
             {"data": [{"tid": "1756774254605"}, {"tid": "1773791700088"}]},
         )
-        assert sent_commands[1] == (RoborockCommand.SET_CUSTOM_MODE, [108])
-        assert sent_commands[2] == (
-            RoborockCommand.APP_ZONED_CLEAN,
-            [[32800, 22750, 34550, 25350, 1]],
+        assert sent_commands[1] == (
+            "set_scenes_zones",
+            {
+                "data": [
+                    {
+                        "tid": "1773791700088",
+                        "zones": [{"zid": 8, "repeat": 1, "range": [32800, 22750, 34550, 25350]}],
+                    }
+                ]
+            },
         )
+        assert sent_commands[2] == (
+            "do_scenes_zones",
+            {
+                "data": [
+                    {
+                        "tid": "1773791700088",
+                        "zones": [{"zid": 8, "repeat": 1, "range": [32800, 22750, 34550, 25350]}],
+                        "fan_power": 108,
+                        "repeat": 1,
+                    }
+                ]
+            },
+        )
+        assert len(sent_commands) == 3
 
     asyncio.run(exercise())
 
@@ -382,20 +402,33 @@ def test_run_scene_retries_step_start_when_device_is_action_locked(tmp_path: Pat
 
 
 class _ScriptedStatusClient:
-    """Minimal stand-in for _RoutineMqttClient that replays a status sequence."""
+    """Minimal stand-in for _RoutineMqttClient that replays a status sequence.
 
-    def __init__(self, status_sequence: list[dict]) -> None:
-        self._statuses = [StatusV2.from_dict(s) for s in status_sequence]
+    Sequence entries that equal the string ``"timeout"`` raise the same
+    RoutineExecutionError that ``send_command`` raises on a real 15s MQTT
+    poll timeout, so tests can simulate transient stalls.
+    """
+
+    def __init__(self, status_sequence: list) -> None:
+        self._sequence = [
+            entry if entry == "timeout" else StatusV2.from_dict(entry)
+            for entry in status_sequence
+        ]
         self._index = 0
         self._logger = logging.getLogger("test-wait")
         self.sent_commands: list[tuple[RoborockCommand, list | dict | None]] = []
 
     async def get_status(self) -> StatusV2:
-        if self._index < len(self._statuses):
-            status = self._statuses[self._index]
+        if self._index < len(self._sequence):
+            entry = self._sequence[self._index]
             self._index += 1
-            return status
-        return self._statuses[-1]
+        else:
+            entry = self._sequence[-1]
+        if entry == "timeout":
+            raise routine_runner_module.RoutineExecutionError(
+                "Command get_status timed out after 15.0s"
+            )
+        return entry
 
     async def send_command(self, command: RoborockCommand, params=None) -> None:
         self.sent_commands.append((command, params))
@@ -406,6 +439,9 @@ _ScriptedStatusClient.wait_for_step_complete = (
 )
 _ScriptedStatusClient.wait_for_dock_settle = (
     routine_runner_module._RoutineMqttClient.wait_for_dock_settle
+)
+_ScriptedStatusClient._poll_status_resilient = (
+    routine_runner_module._RoutineMqttClient._poll_status_resilient
 )
 
 
@@ -586,6 +622,50 @@ def test_wait_for_step_complete_no_resume_when_battery_low(monkeypatch) -> None:
         with pytest.raises(routine_runner_module.RoutineExecutionError, match="Timed out"):
             await client.wait_for_step_complete()
         assert len(client.sent_commands) == 0
+
+    asyncio.run(exercise())
+
+
+def test_wait_for_step_complete_recovers_from_transient_timeout(monkeypatch) -> None:
+    """Transient get_status timeouts mid-cleaning must not abort the step."""
+    monkeypatch.setattr(routine_runner_module, "_STEP_START_POLL_INTERVAL_SECONDS", 0.0)
+    monkeypatch.setattr(routine_runner_module, "_STATUS_POLL_INTERVAL_SECONDS", 0.0)
+    monkeypatch.setattr(routine_runner_module, "_GET_STATUS_RETRY_BACKOFF", 0.0)
+
+    async def exercise() -> None:
+        client = _ScriptedStatusClient([
+            {"state": 18, "in_cleaning": 3},  # segment cleaning
+            "timeout",                         # transient blip (count=1)
+            "timeout",                         # another blip   (count=2)
+            {"state": 18, "in_cleaning": 3},  # recovered → counter resets
+            "timeout",                         # later blip (count=1)
+            "timeout",                         #            (count=2)
+            "timeout",                         #            (count=3)
+            "timeout",                         #            (count=4, still under default 5)
+            {"state": 6, "in_cleaning": 3},   # returning home → counter resets
+            {"state": 8, "in_cleaning": 0},   # step complete
+        ])
+        await client.wait_for_step_complete()
+
+    asyncio.run(exercise())
+
+
+def test_wait_for_step_complete_gives_up_after_too_many_timeouts(monkeypatch) -> None:
+    """When _GET_STATUS_RETRY_LIMIT consecutive timeouts occur, error bubbles up."""
+    monkeypatch.setattr(routine_runner_module, "_STEP_START_POLL_INTERVAL_SECONDS", 0.0)
+    monkeypatch.setattr(routine_runner_module, "_STATUS_POLL_INTERVAL_SECONDS", 0.0)
+    monkeypatch.setattr(routine_runner_module, "_GET_STATUS_RETRY_BACKOFF", 0.0)
+    monkeypatch.setattr(routine_runner_module, "_GET_STATUS_RETRY_LIMIT", 3)
+
+    async def exercise() -> None:
+        client = _ScriptedStatusClient([
+            {"state": 18, "in_cleaning": 3},  # cleaning starts
+            "timeout",
+            "timeout",
+            "timeout",                         # 3rd consecutive — must bubble up
+        ])
+        with pytest.raises(routine_runner_module.RoutineExecutionError, match="timed out after"):
+            await client.wait_for_step_complete()
 
     asyncio.run(exercise())
 
