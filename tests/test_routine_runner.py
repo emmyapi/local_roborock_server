@@ -240,6 +240,9 @@ def test_run_scene_syncs_scene_tids_before_step_commands(tmp_path: Path, monkeyp
                 sent_commands.append((command, params))
                 return ["ok"]
 
+            async def send_command_await_unlock(self, command, params=None):
+                return await self.send_command(command, params)
+
             async def wait_for_step_complete(self) -> None:
                 return None
 
@@ -325,6 +328,69 @@ _ScriptedStatusClient.wait_for_step_complete = (
 _ScriptedStatusClient._poll_status_resilient = (
     routine_runner_module._RoutineMqttClient._poll_status_resilient
 )
+
+
+class _ActionLockedClient:
+    """Stand-in that rejects the first N commands with -10003 'action locked'
+    (device busy with dock mop wash/refill) then accepts."""
+
+    def __init__(self, reject_count: int) -> None:
+        self._logger = logging.getLogger("test-lock")
+        self._reject_count = reject_count
+        self.calls = 0
+
+    async def send_command(self, command, params=None):
+        from roborock.exceptions import RoborockException
+
+        self.calls += 1
+        if self.calls <= self._reject_count:
+            raise RoborockException({"code": -10003, "message": "action locked"})
+        return ["ok"]
+
+
+_ActionLockedClient._is_action_locked = staticmethod(
+    routine_runner_module._RoutineMqttClient._is_action_locked
+)
+_ActionLockedClient.send_command_await_unlock = (
+    routine_runner_module._RoutineMqttClient.send_command_await_unlock
+)
+
+
+def test_send_command_await_unlock_waits_out_action_locked(monkeypatch) -> None:
+    """A -10003 'action locked' rejection is retried (not fatal) until it clears."""
+    monkeypatch.setattr(routine_runner_module, "_ACTION_LOCKED_RETRY_BACKOFF", 0.0)
+
+    async def exercise() -> None:
+        client = _ActionLockedClient(reject_count=2)
+        result = await client.send_command_await_unlock("do_scenes_segments", {"data": []})
+        assert result == ["ok"]
+        assert client.calls == 3  # 2 rejections + 1 success
+
+    asyncio.run(exercise())
+
+
+def test_send_command_await_unlock_propagates_other_errors(monkeypatch) -> None:
+    """Non-action-locked RoborockExceptions are not swallowed by the retry."""
+    from roborock.exceptions import RoborockInvalidStatus
+
+    monkeypatch.setattr(routine_runner_module, "_ACTION_LOCKED_RETRY_BACKOFF", 0.0)
+
+    class _C(_ActionLockedClient):
+        async def send_command(self, command, params=None):
+            self.calls += 1
+            raise RoborockInvalidStatus({"code": -10007, "message": "no such tid"})
+
+    async def exercise() -> None:
+        client = _C(reject_count=99)
+        try:
+            await client.send_command_await_unlock("do_scenes_segments", {"data": []})
+        except RoborockInvalidStatus:
+            pass
+        else:  # pragma: no cover
+            raise AssertionError("expected RoborockInvalidStatus to propagate")
+        assert client.calls == 1  # raised immediately, no retry
+
+    asyncio.run(exercise())
 
 
 def test_wait_for_step_complete_dock_activity_does_not_end_step(monkeypatch) -> None:
