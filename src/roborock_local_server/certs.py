@@ -35,6 +35,19 @@ IOT_COORDINATOR_HOSTS: tuple[str, ...] = (
 )
 IOT_COORDINATOR_CERT_DAYS = 3650
 
+# Tencent Cloud Object Storage bucket the QRevo Curv fetches a pre-TURN config
+# blob from (~8KB over TLS 1.2) ~10s before the TURN coordinator dial. Phase 2d
+# tests whether the vacuum's cert validation on this third-party CDN hostname
+# is CA-lax (unlike the CA-strict verdict on *iot.roborock.com). Wildcards
+# cover the parent cos-eu-frankfurt bucket pattern; adjacent region patterns
+# are reserved for a future broader capture if the vacuum moves bucket.
+TENCENT_COS_HOSTS: tuple[str, ...] = (
+    "conf-eu-1316693915.cos.eu-frankfurt.myqcloud.com",
+    "*.cos.eu-frankfurt.myqcloud.com",
+    "*.myqcloud.com",
+)
+TENCENT_COS_CERT_DAYS = 3650
+
 
 @dataclass(frozen=True)
 class CertificatePaths:
@@ -60,30 +73,59 @@ class CertificateManager:
             key_file=self.paths.certs_dir / "iot_coordinator.key",
         )
 
-    def ensure_iot_coordinator_certificate(self) -> bool:
-        """Generate a self-signed cert for *iot.roborock.com SNI responses.
+    @property
+    def tencent_cos_certificate_paths(self) -> CertificatePaths:
+        return CertificatePaths(
+            cert_file=self.paths.certs_dir / "tencent_cos.crt",
+            key_file=self.paths.certs_dir / "tencent_cos.key",
+        )
 
-        Returns True when a new cert was written, False when the existing one
-        is still valid for our SAN list.
-        """
-        paths = self.iot_coordinator_certificate_paths
-        if self._iot_cert_is_current(paths):
+    def ensure_iot_coordinator_certificate(self) -> bool:
+        """Generate a self-signed cert for *iot.roborock.com SNI responses."""
+        return self._ensure_self_signed_cert(
+            paths=self.iot_coordinator_certificate_paths,
+            hosts=IOT_COORDINATOR_HOSTS,
+            valid_days=IOT_COORDINATOR_CERT_DAYS,
+            label="iot-coordinator",
+        )
+
+    def ensure_tencent_cos_certificate(self) -> bool:
+        """Generate a self-signed cert for Tencent COS config-blob SNIs."""
+        return self._ensure_self_signed_cert(
+            paths=self.tencent_cos_certificate_paths,
+            hosts=TENCENT_COS_HOSTS,
+            valid_days=TENCENT_COS_CERT_DAYS,
+            label="tencent-cos",
+        )
+
+    def _ensure_self_signed_cert(
+        self,
+        *,
+        paths: CertificatePaths,
+        hosts: tuple[str, ...],
+        valid_days: int,
+        label: str,
+    ) -> bool:
+        if self._cert_covers_hosts(paths, hosts):
             return False
         self.paths.certs_dir.mkdir(parents=True, exist_ok=True)
         _write_self_signed_cert(
             cert_file=paths.cert_file,
             key_file=paths.key_file,
-            hosts=IOT_COORDINATOR_HOSTS,
-            valid_days=IOT_COORDINATOR_CERT_DAYS,
+            hosts=hosts,
+            valid_days=valid_days,
         )
         LOG.info(
-            "Wrote self-signed iot-coordinator cert (%s) covering %s",
+            "Wrote self-signed %s cert (%s) covering %s",
+            label,
             paths.cert_file,
-            ", ".join(IOT_COORDINATOR_HOSTS),
+            ", ".join(hosts),
         )
         return True
 
-    def _iot_cert_is_current(self, paths: CertificatePaths) -> bool:
+    def _cert_covers_hosts(
+        self, paths: CertificatePaths, hosts: tuple[str, ...]
+    ) -> bool:
         if not paths.cert_file.exists() or not paths.key_file.exists():
             return False
         try:
@@ -96,8 +138,8 @@ class CertificateManager:
             san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
         except x509.ExtensionNotFound:
             return False
-        present = {name.value for name in san.get_values_for_type(x509.DNSName)}
-        return set(IOT_COORDINATOR_HOSTS).issubset(present)
+        present = set(san.get_values_for_type(x509.DNSName))
+        return set(hosts).issubset(present)
 
     def ensure_certificate(self) -> bool:
         if self.config.tls.mode == "provided":
