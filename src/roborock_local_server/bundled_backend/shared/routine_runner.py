@@ -27,7 +27,7 @@ def _ensure_local_python_roborock_on_path() -> None:
 _ensure_local_python_roborock_on_path()
 
 from roborock.data import RRiot, Reference, RoborockInCleaning, StatusV2
-from roborock.exceptions import RoborockInvalidStatus, RoborockUnsupportedFeature
+from roborock.exceptions import RoborockException, RoborockInvalidStatus, RoborockUnsupportedFeature
 from roborock.mqtt.roborock_session import create_mqtt_session
 from roborock.protocol import create_mqtt_decoder, create_mqtt_encoder, create_mqtt_params
 from roborock.protocols.v1_protocol import RequestMessage, create_security_data, decode_rpc_response
@@ -64,6 +64,13 @@ _ACTION_LOCK_RETRY_DELAY_SECONDS = 5.0
 _ACTION_LOCK_RETRY_ATTEMPTS = 6
 _GET_STATUS_RETRY_LIMIT = 5
 _GET_STATUS_RETRY_BACKOFF = 1.0
+# Device RPC error -10003 "action locked": the robot rejects clean/scene
+# commands while it is busy with dock maintenance (mop wash/dry/refill)
+# between mop segments. It clears once the wash+refill finishes. Wait it out
+# rather than aborting the whole routine.
+_ACTION_LOCKED_CODE = -10003
+_ACTION_LOCKED_RETRY_TIMEOUT_SECONDS = 8 * 60
+_ACTION_LOCKED_RETRY_BACKOFF = 10.0
 from .inventory_io import WEB_API_INVENTORY_FILE
 _SUPPORTED_METHODS = {
     "do_scenes_app_start",
@@ -626,6 +633,50 @@ class _RoutineMqttClient:
         finally:
             self._pending.pop(request.request_id, None)
 
+    @staticmethod
+    def _is_action_locked(exc: BaseException) -> bool:
+        """True if a device RPC error is -10003 'action locked'.
+
+        The roborock lib surfaces unmapped error codes as a base
+        RoborockException carrying the raw error dict in args, so match on the
+        code rather than the message.
+        """
+        for arg in getattr(exc, "args", ()):
+            if isinstance(arg, dict) and arg.get("code") == _ACTION_LOCKED_CODE:
+                return True
+        return False
+
+    async def send_command_await_unlock(
+        self,
+        command: RoborockCommand | str,
+        params: dict[str, Any] | list[Any] | None = None,
+    ) -> Any:
+        """Like send_command, but wait out the device's -10003 'action locked'
+        state (busy with dock mop wash/refill between segments) and retry,
+        instead of letting it abort the routine. Every other error — including
+        RoborockInvalidStatus / RoborockUnsupportedFeature — propagates
+        unchanged, so existing fallback handling is preserved.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _ACTION_LOCKED_RETRY_TIMEOUT_SECONDS
+        label = command.value if isinstance(command, RoborockCommand) else str(command)
+        attempt = 0
+        while True:
+            try:
+                return await self.send_command(command, params)
+            except RoborockException as exc:
+                if not self._is_action_locked(exc) or loop.time() >= deadline:
+                    raise
+                attempt += 1
+                self._logger.warning(
+                    "Command %s rejected (action locked); device busy at dock "
+                    "(mop wash/refill). Waiting %.0fs and retrying (attempt %d)",
+                    label,
+                    _ACTION_LOCKED_RETRY_BACKOFF,
+                    attempt,
+                )
+                await asyncio.sleep(_ACTION_LOCKED_RETRY_BACKOFF)
+
     async def get_status(self) -> StatusV2:
         response = await self.send_command(RoborockCommand.GET_STATUS)
         if isinstance(response, list) and response:
@@ -1169,7 +1220,7 @@ class RoutineRunner:
                             push_method,
                             push_params,
                         )
-                        await client.send_command(push_method, push_params)
+                        await client.send_command_await_unlock(push_method, push_params)
                     except (RoborockUnsupportedFeature, RoborockInvalidStatus) as exc:
                         logger.info(
                             "Routine step=%s scene definition push method=%s failed (%s); "
@@ -1186,7 +1237,7 @@ class RoutineRunner:
                         native_method,
                         native_params,
                     )
-                    await client.send_command(native_method, native_params)
+                    await client.send_command_await_unlock(native_method, native_params)
                 except (RoborockUnsupportedFeature, RoborockInvalidStatus) as exc:
                     logger.info(
                         "Routine step=%s native method=%s failed (%s); falling back to translated commands",
@@ -1206,7 +1257,7 @@ class RoutineRunner:
                             routine_command.params,
                         )
                         try:
-                            await client.send_command(routine_command.command, routine_command.params)
+                            await client.send_command_await_unlock(routine_command.command, routine_command.params)
                         except RoborockUnsupportedFeature as exc:
                             if not _is_optional_unsupported_command(routine_command.command, exc):
                                 raise
