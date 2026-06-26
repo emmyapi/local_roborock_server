@@ -27,7 +27,7 @@ def _ensure_local_python_roborock_on_path() -> None:
 _ensure_local_python_roborock_on_path()
 
 from roborock.data import RRiot, Reference, RoborockInCleaning, StatusV2
-from roborock.exceptions import RoborockUnsupportedFeature
+from roborock.exceptions import RoborockInvalidStatus, RoborockUnsupportedFeature
 from roborock.mqtt.roborock_session import create_mqtt_session
 from roborock.protocol import create_mqtt_decoder, create_mqtt_encoder, create_mqtt_params
 from roborock.protocols.v1_protocol import RequestMessage, create_security_data, decode_rpc_response
@@ -42,7 +42,9 @@ __all__ = [
     "RoutineRunner",
     "RoutineStep",
     "commands_for_step",
+    "native_command_for_step",
     "parse_scene_steps",
+    "scene_definition_push_for_step",
     "scene_device_id",
 ]
 
@@ -57,6 +59,8 @@ _ROUTINE_READY_STATES = {3, 8, 100}
 _RESUME_BATTERY_THRESHOLD = 80
 _POST_STEP_SETTLE_SECONDS = 15.0
 _POST_STEP_SETTLE_TIMEOUT_SECONDS = 10 * 60
+_GET_STATUS_RETRY_LIMIT = 5
+_GET_STATUS_RETRY_BACKOFF = 1.0
 from .inventory_io import WEB_API_INVENTORY_FILE
 _SUPPORTED_METHODS = {
     "do_scenes_app_start",
@@ -335,15 +339,80 @@ def _settings_commands(entry: dict[str, Any]) -> list[RoutineCommand]:
     return commands
 
 
+def native_command_for_step(step: RoutineStep) -> tuple[str, dict[str, Any] | list[Any] | None]:
+    """Return the native Roborock scene method + params for a routine step.
+
+    Sending the scene's original method (e.g. ``do_scenes_segments``) with its
+    full params preserves all routine semantics — clean_order_mode, auto_dry,
+    auto_dustCollection, fan_power, water_box_mode, mop_mode, etc. — which the
+    translated APP_SEGMENT_CLEAN path drops.
+    """
+    return step.method, step.params
+
+
+_DO_TO_SET_SCENE_METHOD: dict[str, str] = {
+    "do_scenes_segments": "set_scenes_segments",
+    "do_scenes_zones": "set_scenes_zones",
+    "do_scenes_app_start": "set_scenes_app_start",
+}
+
+
+def scene_definition_push_for_step(
+    step: RoutineStep,
+) -> tuple[str, dict[str, Any]] | None:
+    """Return the ``set_scenes_*`` method + params needed to register this
+    step's scene on the device before ``do_scenes_*`` can reference it.
+
+    The device only accepts ``do_scenes_segments`` for tids it knows about
+    (``get_scenes_valid_tids``). The Roborock app pushes scenes via
+    ``set_scenes_segments`` / ``set_scenes_zones`` before invoking them.
+    Returns ``None`` if the step's method or params shape is unsupported
+    (caller should skip the push and let native dispatch fail loudly).
+    """
+    set_method = _DO_TO_SET_SCENE_METHOD.get(step.method)
+    if set_method is None or not isinstance(step.params, dict):
+        return None
+    data = step.params.get("data")
+    if not isinstance(data, list) or not data:
+        return None
+
+    push_entries: list[dict[str, Any]] = []
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        tid = str(entry.get("tid") or "").strip()
+        if not tid:
+            continue
+        push_entry: dict[str, Any] = {"tid": tid}
+        if "segs" in entry:
+            push_entry["segs"] = entry["segs"]
+        if "zones" in entry:
+            push_entry["zones"] = entry["zones"]
+        if "map_flag" in entry:
+            push_entry["map_flag"] = entry["map_flag"]
+        push_entries.append(push_entry)
+
+    if not push_entries:
+        return None
+    return set_method, {"data": push_entries}
+
+
 def commands_for_step(step: RoutineStep) -> list[RoutineCommand]:
     if step.method == "do_scenes_segments":
         entry = _single_data_entry(step)
         repeat = max(1, _as_int(entry.get("repeat"), 1))
+        segment_payload: dict[str, Any] = {
+            "segments": _segment_ids(entry),
+            "repeat": repeat,
+        }
+        for key in ("clean_order_mode", "fan_power", "water_box_mode", "mop_mode", "mop_template_id"):
+            if key in entry:
+                segment_payload[key] = entry[key]
         return [
             *_settings_commands(entry),
             RoutineCommand(
                 RoborockCommand.APP_SEGMENT_CLEAN,
-                [{"segments": _segment_ids(entry), "repeat": repeat}],
+                [segment_payload],
             ),
         ]
     if step.method == "do_scenes_zones":
@@ -491,7 +560,7 @@ class _RoutineMqttClient:
 
     async def send_command(
         self,
-        command: RoborockCommand,
+        command: RoborockCommand | str,
         params: dict[str, Any] | list[Any] | None = None,
     ) -> Any:
         if self._session is None:
@@ -506,12 +575,13 @@ class _RoutineMqttClient:
         )
         encoded = self._encoder(message)
 
+        method_label = command.value if isinstance(command, RoborockCommand) else str(command)
         try:
             await self._session.publish(self._publish_topic, encoded)
             return await asyncio.wait_for(future, timeout=_COMMAND_TIMEOUT_SECONDS)
         except TimeoutError as exc:
             raise RoutineExecutionError(
-                f"Command {command.value} timed out after {_COMMAND_TIMEOUT_SECONDS}s"
+                f"Command {method_label} timed out after {_COMMAND_TIMEOUT_SECONDS}s"
             ) from exc
         finally:
             self._pending.pop(request.request_id, None)
@@ -526,6 +596,28 @@ class _RoutineMqttClient:
         if status is None:
             raise RoutineExecutionError(f"Unable to parse get_status response: {response!r}")
         return status
+
+    async def _poll_status_resilient(self, deadline: float) -> StatusV2:
+        consecutive_failures = 0
+        loop = asyncio.get_running_loop()
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise TimeoutError
+            try:
+                return await asyncio.wait_for(self.get_status(), timeout=remaining)
+            except RoutineExecutionError as exc:
+                if "timed out after" not in str(exc):
+                    raise
+                consecutive_failures += 1
+                if consecutive_failures >= _GET_STATUS_RETRY_LIMIT:
+                    raise
+                self._logger.warning(
+                    "get_status timed out (%d/%d consecutive); retrying",
+                    consecutive_failures,
+                    _GET_STATUS_RETRY_LIMIT,
+                )
+                await asyncio.sleep(_GET_STATUS_RETRY_BACKOFF)
 
     async def wait_for_step_complete(self) -> None:
         last_observed = None
@@ -542,7 +634,7 @@ class _RoutineMqttClient:
                 if remaining <= 0:
                     raise TimeoutError
 
-                status = await asyncio.wait_for(self.get_status(), timeout=remaining)
+                status = await self._poll_status_resilient(step_deadline)
                 state = _enum_or_int_value(status.state)
                 in_cleaning = _enum_or_int_value(status.in_cleaning)
                 battery = int(status.battery) if status.battery is not None else -1
@@ -645,7 +737,7 @@ class _RoutineMqttClient:
                 )
                 break
 
-            status = await asyncio.wait_for(self.get_status(), timeout=remaining)
+            status = await self._poll_status_resilient(deadline)
             state = _enum_or_int_value(status.state)
             in_cleaning = _enum_or_int_value(status.in_cleaning)
             observed = (state, in_cleaning)
@@ -967,28 +1059,66 @@ class RoutineRunner:
         try:
             await self._sync_scene_tids(client=client, scene=scene, device_id=device_id, logger=logger)
             for step_index, step in enumerate(steps):
-                commands = commands_for_step(step)
                 waits_for_step_complete = RoborockDataProtocol.TASK_COMPLETE.value in step.finish_dp_ids
-                for routine_command in commands:
-                    logger.info(
-                        "Routine step=%s method=%s command=%s params=%s",
-                        step.step_id,
-                        step.method,
-                        routine_command.command.value,
-                        routine_command.params,
-                    )
+                native_method, native_params = native_command_for_step(step)
+                push = scene_definition_push_for_step(step)
+                if push is not None:
+                    push_method, push_params = push
                     try:
-                        await client.send_command(routine_command.command, routine_command.params)
-                    except RoborockUnsupportedFeature as exc:
-                        if not _is_optional_unsupported_command(routine_command.command, exc):
-                            raise
-                        logger.warning(
-                            "Skipping unsupported routine command step=%s method=%s command=%s: %s",
+                        logger.info(
+                            "Routine step=%s pushing scene definition method=%s params=%s",
+                            step.step_id,
+                            push_method,
+                            push_params,
+                        )
+                        await client.send_command(push_method, push_params)
+                    except (RoborockUnsupportedFeature, RoborockInvalidStatus) as exc:
+                        logger.info(
+                            "Routine step=%s scene definition push method=%s failed (%s); "
+                            "continuing with native dispatch",
+                            step.step_id,
+                            push_method,
+                            exc,
+                        )
+                used_native = True
+                try:
+                    logger.info(
+                        "Routine step=%s native method=%s params=%s",
+                        step.step_id,
+                        native_method,
+                        native_params,
+                    )
+                    await client.send_command(native_method, native_params)
+                except (RoborockUnsupportedFeature, RoborockInvalidStatus) as exc:
+                    logger.info(
+                        "Routine step=%s native method=%s failed (%s); falling back to translated commands",
+                        step.step_id,
+                        native_method,
+                        exc,
+                    )
+                    used_native = False
+
+                if not used_native:
+                    for routine_command in commands_for_step(step):
+                        logger.info(
+                            "Routine step=%s method=%s command=%s params=%s (fallback)",
                             step.step_id,
                             step.method,
                             routine_command.command.value,
-                            exc,
+                            routine_command.params,
                         )
+                        try:
+                            await client.send_command(routine_command.command, routine_command.params)
+                        except RoborockUnsupportedFeature as exc:
+                            if not _is_optional_unsupported_command(routine_command.command, exc):
+                                raise
+                            logger.warning(
+                                "Skipping unsupported routine command step=%s method=%s command=%s: %s",
+                                step.step_id,
+                                step.method,
+                                routine_command.command.value,
+                                exc,
+                            )
                 if waits_for_step_complete:
                     logger.info("Waiting for ready state step=%s scene=%s", step.step_id, _scene_name(scene))
                     await client.wait_for_step_complete()
