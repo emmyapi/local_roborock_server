@@ -64,6 +64,7 @@ class MqttTlsProxy:
         self.runtime_credentials = runtime_credentials
         self.zone_ranges_store = zone_ranges_store
         self._server_socket: socket.socket | None = None
+        self._accept_thread: threading.Thread | None = None
         self._running = False
         self._counter = 0
         self._lock = threading.Lock()
@@ -812,6 +813,7 @@ class MqttTlsProxy:
     def start(self) -> threading.Thread:
         self._ensure_trace_worker()
         thread = threading.Thread(target=self._run, daemon=True, name="mqtt-tls-proxy")
+        self._accept_thread = thread
         thread.start()
         return thread
 
@@ -863,6 +865,9 @@ class MqttTlsProxy:
         self._server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._server_socket.bind((self.listen_host, self.listen_port))
         self._server_socket.listen(10)
+        # Bounded accept() so the loop re-checks _running periodically and the
+        # listening socket is guaranteed released on stop() before any rebind.
+        self._server_socket.settimeout(1.0)
         self._running = True
         self.logger.info(
             "%s MQTT proxy listening on %s:%d -> %s:%d",
@@ -876,10 +881,16 @@ class MqttTlsProxy:
         while self._running:
             try:
                 raw_conn, addr = self._server_socket.accept()
+                # Clear the inherited accept-timeout; per-connection sockets
+                # must stay blocking for the TLS handshake and relay loops.
+                raw_conn.settimeout(None)
                 client_conn = self._accept_client_connection(raw_conn=raw_conn, addr=addr, tls_ctx=tls_ctx)
                 if client_conn is None:
                     continue
                 threading.Thread(target=self._handle_client, args=(client_conn, addr), daemon=True).start()
+            except (TimeoutError, socket.timeout):
+                # Expected: bounded accept() woke up so we can re-check _running.
+                continue
             except OSError as exc:
                 if not self._running:
                     break
@@ -894,6 +905,19 @@ class MqttTlsProxy:
                 self._server_socket.close()
             except OSError:
                 pass
+        # Wait for the accept loop to fully exit before returning, so the
+        # listening socket is released and a subsequent rebind on the same
+        # port (e.g. reload_tls_services after cert renewal) cannot collide
+        # with the old listener (EADDRINUSE).
+        accept_thread = self._accept_thread
+        self._accept_thread = None
+        if accept_thread is not None and accept_thread.is_alive():
+            accept_thread.join(timeout=5.0)
+            if accept_thread.is_alive():
+                self.logger.warning(
+                    "mqtt-tls-proxy accept loop did not exit within timeout; "
+                    "rebind may fail"
+                )
         trace_thread: threading.Thread | None = None
         with self._lock:
             trace_thread = self._trace_thread
