@@ -288,6 +288,8 @@ def test_run_scene_syncs_scene_tids_before_step_commands(tmp_path: Path, monkeyp
 
 
 def test_run_scene_retries_step_start_when_device_is_action_locked(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(routine_runner_module, "_ACTION_LOCKED_RETRY_BACKOFF", 0.0)
+
     async def exercise() -> None:
         device_id = "6HL2zfniaoYYV01CkVuhkO"
         scene = {
@@ -355,7 +357,8 @@ def test_run_scene_retries_step_start_when_device_is_action_locked(tmp_path: Pat
 
         class FakeRoutineClient:
             def __init__(self, context, device, logger) -> None:
-                _ = context, device, logger
+                _ = context, device
+                self._logger = logger or logging.getLogger("test-fake-routine")
 
             async def connect(self) -> None:
                 return None
@@ -366,7 +369,7 @@ def test_run_scene_retries_step_start_when_device_is_action_locked(tmp_path: Pat
             async def send_command(self, command, params=None):
                 nonlocal segment_attempts
                 sent_commands.append((command, params))
-                if command == RoborockCommand.APP_SEGMENT_CLEAN:
+                if command == "do_scenes_segments":
                     segment_attempts += 1
                     if segment_attempts == 2:
                         raise RoborockException({"code": -10003, "message": "action locked"})
@@ -378,23 +381,35 @@ def test_run_scene_retries_step_start_when_device_is_action_locked(tmp_path: Pat
             async def wait_for_dock_settle(self, *, initial_delay_seconds=15.0) -> None:
                 settle_calls.append(float(initial_delay_seconds))
 
+        # Native scene dispatch sends through send_command_await_unlock, so the
+        # fake needs the real retry wrapper for the -10003 retry to be exercised.
+        FakeRoutineClient._is_action_locked = staticmethod(
+            routine_runner_module._RoutineMqttClient._is_action_locked
+        )
+        FakeRoutineClient.send_command_await_unlock = (
+            routine_runner_module._RoutineMqttClient.send_command_await_unlock
+        )
+
         monkeypatch.setattr(routine_runner_module, "_RoutineMqttClient", FakeRoutineClient)
 
         runner = RoutineRunner(_test_context(tmp_path))
         await runner._run_scene(scene=scene, steps=parse_scene_steps(scene))
 
-        assert sent_commands == [
-            (
-                RoborockCommand.REUNION_SCENES,
-                {"data": [{"tid": "1755507280460"}, {"tid": "1755507296636"}]},
-            ),
-            (RoborockCommand.SET_CUSTOM_MODE, [108]),
-            (RoborockCommand.APP_SEGMENT_CLEAN, [{"segments": [18], "repeat": 1}]),
-            (RoborockCommand.SET_CUSTOM_MODE, [103]),
-            (RoborockCommand.APP_SEGMENT_CLEAN, [{"segments": [19], "repeat": 1}]),
-            (RoborockCommand.APP_SEGMENT_CLEAN, [{"segments": [19], "repeat": 1}]),
+        # Native scene dispatch: each step pushes its scene definition and then
+        # dispatches do_scenes_segments. The second step's native dispatch is
+        # rejected once with -10003 and must be retried, not abort the scene.
+        assert [command for command, _ in sent_commands] == [
+            RoborockCommand.REUNION_SCENES,
+            "set_scenes_segments",
+            "do_scenes_segments",
+            "set_scenes_segments",
+            "do_scenes_segments",
+            "do_scenes_segments",
         ]
-        assert settle_calls == [15.0, 5.0]
+        assert segment_attempts == 3
+        # The retry re-sends the identical native command.
+        assert sent_commands[-1] == sent_commands[-2]
+        assert settle_calls == [15.0]
 
     asyncio.run(exercise())
 
