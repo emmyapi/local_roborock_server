@@ -1,0 +1,136 @@
+import json
+from pathlib import Path
+
+import pytest
+
+from roborock_local_server.legacy_migration import MigrationError, apply, prepare, records
+
+
+def fixture(tmp_path):
+    data, output = tmp_path / 'data', tmp_path / 'out'
+    data.mkdir()
+    credentials = {'schema_version': 2, 'devices': [{'did': 'test', 'localkey': 'dummy', 'device_mqtt_usr': 'dummy', 'device_mqtt_pass': 'dummy'}]}
+    (data / 'runtime_credentials.json').write_text(json.dumps(credentials))
+    scene = {'param': {'action': {'items': [{'param': {'method': 'do_scenes_zones', 'params': {'data': [{'tid': 't', 'zones': [{'zid': 7}, {'zid': 8}]}]}}}]}}}
+    (data / 'web_api_inventory.json').write_text(json.dumps({'scenes': [scene]}))
+    return data, output
+
+
+def response(zid=7, value=None, error=None):
+    return {'topic': 'rr/d/user/test/device', 'decoded_messages': [{'response_to': {'request_method': 'set_scenes_zones', 'request_params': {'data': [{'tid': 'temporary', 'zones': [{'zid': 0, 'range': value or [1, 2, 3, 4]}]}]}, 'result': [{'tid': 't', 'zones': [{'zid': zid}]}], 'error': error}}]}
+
+
+def write_log(data, entries):
+    (data / 'decompiled_mqtt.jsonl').write_text(''.join(json.dumps(v) + '\n' for v in entries))
+
+
+def test_explicit_prepare_and_apply_preserve_credentials_and_merge_all_required(tmp_path):
+    data, output = fixture(tmp_path)
+    write_log(data, [response(7), response(8), response(7, [5, 6, 7, 8])])
+    before = (data / 'runtime_credentials.json').read_bytes()
+    result = prepare(data, output)
+    assert not (data / 'zone_ranges.json').exists()
+    assert result['counts']['required_zones'] == 2
+    assert json.loads((output / 'zone_ranges.json').read_text()) == {'t:7': [5, 6, 7, 8], 't:8': [1, 2, 3, 4]}
+    with pytest.raises(MigrationError):
+        apply(data, output, writers_stopped=False)
+    apply(data, output, writers_stopped=True)
+    assert json.loads((data / 'runtime_credentials.json').read_text()) == json.loads(before)
+    assert (data / 'migration_pending.json').exists()
+    assert apply(data, output, writers_stopped=True)['phase'] == 'state_installed'
+
+
+def test_failed_response_does_not_recover_missing_geometry(tmp_path):
+    data, output = fixture(tmp_path)
+    write_log(data, [response(7), response(8, error={'code': -1})])
+    with pytest.raises(MigrationError, match='missing=1'):
+        prepare(data, output)
+
+
+def test_partial_current_store_preserved_and_missing_tuple_recovered(tmp_path):
+    data, output = fixture(tmp_path)
+    (data / 'zone_ranges.json').write_text(json.dumps({'t:7': [9, 9, 10, 10]}))
+    write_log(data, [response(7), response(8)])
+    prepare(data, output)
+    assert json.loads((output / 'zone_ranges.json').read_text())['t:7'] == [9, 9, 10, 10]
+
+
+@pytest.mark.parametrize('payload', [b'{}', b'\xff\n', b'[]\n', b'{broken}\n', b'x' * (1024 * 1024 + 1) + b'\n'])
+def test_bad_record_blocks_without_unbounded_read(tmp_path, payload):
+    path = tmp_path / 'log'
+    path.write_bytes(payload)
+    with pytest.raises(MigrationError):
+        list(records(path, len(payload)))
+
+
+def test_appended_replaced_or_truncated_source_blocks_apply(tmp_path):
+    data, output = fixture(tmp_path)
+    write_log(data, [response(7), response(8)])
+    prepare(data, output)
+    with (data / 'decompiled_mqtt.jsonl').open('a') as stream:
+        stream.write('{}\n')
+    with pytest.raises(MigrationError, match='source changed'):
+        apply(data, output, writers_stopped=True)
+    assert not (data / 'zone_ranges.json').exists()
+
+
+def test_missing_password_never_guessed_from_connect_preview(tmp_path):
+    data, output = fixture(tmp_path)
+    value = json.loads((data / 'runtime_credentials.json').read_text())
+    value['devices'][0]['device_mqtt_pass'] = ''
+    (data / 'runtime_credentials.json').write_text(json.dumps(value))
+    with pytest.raises(MigrationError, match='identity reconciliation'):
+        prepare(data, output)
+
+
+def test_retire_preserves_exact_original_inodes_and_resumes(tmp_path):
+    from roborock_local_server.legacy_migration import retire
+    data, output = fixture(tmp_path)
+    write_log(data, [response(7), response(8)])
+    (data / 'mqtt_server.log').write_text('legacy diagnostic\n')
+    original_inode = (data / 'mqtt_server.log').stat().st_ino
+    prepare(data, output)
+    apply(data, output, writers_stopped=True)
+    result = retire(data, output, writers_stopped=True)
+    assert result['phase'] == 'logs_retired'
+    assert (data / 'retired-diagnostics' / 'mqtt_server.log').stat().st_ino == original_inode
+    assert not (data / 'migration_pending.json').exists()
+    assert retire(data, output, writers_stopped=True)['phase'] == 'logs_retired'
+
+
+def test_partial_apply_reconciles_exact_candidate_and_original(tmp_path, monkeypatch):
+    import roborock_local_server.legacy_migration as migration
+    data, output = fixture(tmp_path)
+    write_log(data, [response(7), response(8)])
+    prepare(data, output)
+    real = migration.atomic_json
+    failed = False
+    def fail_one(path, value):
+        nonlocal failed
+        if path == data / 'zone_ranges.json' and not failed:
+            failed = True
+            raise OSError('synthetic full disk')
+        real(path, value)
+    monkeypatch.setattr(migration, 'atomic_json', fail_one)
+    with pytest.raises(OSError):
+        apply(data, output, writers_stopped=True)
+    assert (data / 'migration_pending.json').exists()
+    assert apply(data, output, writers_stopped=True)['phase'] == 'state_installed'
+
+
+def test_uncertain_write_can_resume_but_unexpected_state_blocks(tmp_path, monkeypatch):
+    import roborock_local_server.legacy_migration as migration
+    data, output = fixture(tmp_path)
+    write_log(data, [response(7), response(8)])
+    prepare(data, output)
+    real = migration.atomic_json
+    def uncertain(path, value):
+        real(path, value)
+        if path == data / 'zone_ranges.json':
+            raise OSError('synthetic directory fsync failure')
+    monkeypatch.setattr(migration, 'atomic_json', uncertain)
+    with pytest.raises(OSError):
+        apply(data, output, writers_stopped=True)
+    (data / 'zone_ranges.json').write_text('{"t:7":[99,99,100,100]}')
+    with pytest.raises(MigrationError, match='unexpected authoritative'):
+        apply(data, output, writers_stopped=True)

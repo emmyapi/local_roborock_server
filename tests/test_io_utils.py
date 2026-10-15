@@ -136,3 +136,10 @@ def test_rotation_after_registry_restart_and_utf8_text_bound(tmp_path, monkeypat
     logger.info("é" * 1000)
     assert len((tmp_path / "text.log").read_bytes()) <= 256
     io.close_log_writers()
+
+
+def test_header_redaction_consumes_multitoken_values(tmp_path):
+    from roborock_local_server.bundled_backend.shared.io_utils import payload_preview
+    for text in ('Authorization: Bearer PRIVATE_TOKEN', 'Cookie: first=PRIVATE_A; second=PRIVATE_B', 'authorization="Bearer PRIVATE_TOKEN"'):
+        value = payload_preview(text.encode())
+        assert 'PRIVATE' not in value

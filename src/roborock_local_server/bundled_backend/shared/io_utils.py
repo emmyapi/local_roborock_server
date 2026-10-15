@@ -29,6 +29,9 @@ _TEXT_SECRET = re.compile(r"(?i)(\b(?:password|passwd|token|secret|authorization
 
 
 def _redact_text(text: str) -> str:
+    # Header values may contain spaces (Bearer auth, cookie pairs). Consume the
+    # complete field through a newline, or the closing quote for quoted values.
+    text = re.sub(r'(?i)(\b(?:authorization|cookie)\b["\']?\s*[:=]\s*)(?:"[^"\r\n]*"|\'[^\'\r\n]*\'|[^\r\n]*)', r'\1[REDACTED]', text)
     text = _TEXT_SECRET.sub(r"\1[REDACTED]", text)
     if "CONNECT" in text:
         text = re.sub(r"\bhex=\S+", "hex=[REDACTED]", text)
