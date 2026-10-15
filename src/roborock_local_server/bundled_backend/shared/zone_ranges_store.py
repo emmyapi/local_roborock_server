@@ -36,6 +36,14 @@ def _parse_key(key: str) -> tuple[str, int] | None:
         return None
 
 
+
+def _validated_zone(tid: Any, zid: Any, coords: Any) -> tuple[str, list[int]]:
+    if (not isinstance(tid, str) or not tid.strip() or type(zid) is not int or zid < 0
+            or not isinstance(coords, list) or len(coords) != 4
+            or any(type(value) is not int for value in coords)):
+        raise PersistenceError("Invalid zone geometry or assigned identity; state was not published")
+    return _key(tid.strip(), zid), list(coords)
+
 class ZoneRangesStore:
     """Thread-safe, JSON-backed cache of zone range coordinates."""
 
@@ -86,30 +94,22 @@ class ZoneRangesStore:
             return result
 
     def put(self, tid: str, zid: int, range_coords: list[int]) -> None:
-        if not tid or zid < 0 or not isinstance(range_coords, list) or len(range_coords) < 4:
-            return
-        coords = [int(v) for v in range_coords[:4]]
-        self._commit({_key(tid, zid): coords})
+        key, coords = _validated_zone(tid, zid, range_coords)
+        self._commit({key: coords})
 
     def merge_set_scenes_zones_request(self, params: Any) -> None:
         """Extract and store ranges from a set_scenes_zones RPC request."""
-        if not isinstance(params, dict):
-            return
-        data = params.get("data")
-        if not isinstance(data, list):
-            return
+        if not isinstance(params, dict) or not isinstance(params.get("data"), list):
+            raise PersistenceError("Invalid zone request batch")
         updates = {}
-        for entry in data:
-            if not isinstance(entry, dict):
-                continue
-            tid = str(entry.get("tid") or "").strip()
-            for zone in entry.get("zones") or []:
+        for entry in params["data"]:
+            if not isinstance(entry, dict) or not isinstance(entry.get("zones"), list):
+                raise PersistenceError("Invalid zone request batch")
+            for zone in entry["zones"]:
                 if not isinstance(zone, dict):
-                    continue
-                zid = zone.get("zid")
-                range_value = zone.get("range")
-                if tid and isinstance(zid, int) and isinstance(range_value, list) and len(range_value) >= 4:
-                    updates[_key(tid, zid)] = [int(v) for v in range_value[:4]]
+                    raise PersistenceError("Invalid zone request entry")
+                key, coords = _validated_zone(entry.get("tid"), zone.get("zid"), zone.get("range"))
+                updates[key] = coords
         self._commit(updates)
 
     def seed_from_mqtt_jsonl(self, mqtt_jsonl: Path) -> int:
@@ -157,25 +157,21 @@ class ZoneRangesStore:
         ``zid`` while the request's ``params`` contains the ``range`` values.
         """
         if not isinstance(request_params, dict) or not isinstance(result, list):
-            return
+            raise PersistenceError("Invalid successful zone response")
         request_data = request_params.get("data")
-        if not isinstance(request_data, list):
-            return
+        if not isinstance(request_data, list) or len(request_data) != len(result):
+            raise PersistenceError("Incomplete successful zone response batch")
         updates = {}
         for req_entry, res_entry in zip(request_data, result):
             if not isinstance(req_entry, dict) or not isinstance(res_entry, dict):
-                continue
-            tid = str(res_entry.get("tid") or "").strip()
-            if not tid:
-                continue
-            req_zones = req_entry.get("zones") or []
-            res_zones = res_entry.get("zones") or []
-            for idx, req_zone in enumerate(req_zones):
-                if not isinstance(req_zone, dict):
-                    continue
-                res_zone = res_zones[idx] if idx < len(res_zones) and isinstance(res_zones[idx], dict) else {}
-                zid = res_zone.get("zid")
-                range_value = req_zone.get("range")
-                if type(zid) is int and zid >= 0 and isinstance(range_value, list) and len(range_value) >= 4:
-                    updates[_key(tid, zid)] = [int(v) for v in range_value[:4]]
+                raise PersistenceError("Invalid successful zone response entry")
+            req_zones = req_entry.get("zones")
+            res_zones = res_entry.get("zones")
+            if not isinstance(req_zones, list) or not isinstance(res_zones, list) or len(req_zones) != len(res_zones):
+                raise PersistenceError("Incomplete successful zone response entries")
+            for req_zone, res_zone in zip(req_zones, res_zones):
+                if not isinstance(req_zone, dict) or not isinstance(res_zone, dict):
+                    raise PersistenceError("Invalid successful zone response zone")
+                key, coords = _validated_zone(res_entry.get("tid"), res_zone.get("zid"), req_zone.get("range"))
+                updates[key] = coords
         self._commit(updates)

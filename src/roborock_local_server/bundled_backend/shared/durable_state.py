@@ -45,16 +45,33 @@ class PersistenceUncertainError(PersistenceError):
     """Replacement succeeded but directory durability could not be confirmed."""
 
 
+MAX_STATE_BYTES = 64 * 1024 * 1024
+MAX_STATE_KEYS = 10_000
+
+
+def reject_symlinks(path: Path) -> None:
+    for candidate in (path, *path.parents):
+        if candidate.is_symlink():
+            raise PersistenceError("Authoritative state paths must not contain symlinks")
+
+
 def load_json_object(path: Path) -> dict[str, Any]:
     try:
-        with path.open(encoding="utf-8") as handle:
-            value = json.load(handle)
+        reject_symlinks(path)
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(descriptor, "rb") as handle:
+            if os.fstat(handle.fileno()).st_size > MAX_STATE_BYTES:
+                raise PersistenceError("Authoritative state exceeds byte limit")
+            encoded = handle.read(MAX_STATE_BYTES + 1)
+            if len(encoded) > MAX_STATE_BYTES:
+                raise PersistenceError("Authoritative state exceeds byte limit")
+            value = json.loads(encoded)
     except FileNotFoundError:
         return {}
     except (OSError, ValueError) as exc:
         raise PersistenceError(f"Cannot load authoritative state {path.name}; restore or migrate state") from exc
-    if not isinstance(value, dict):
-        raise PersistenceError(f"Invalid authoritative state {path.name}; expected object")
+    if not isinstance(value, dict) or len(value) > MAX_STATE_KEYS:
+        raise PersistenceError(f"Invalid authoritative state {path.name}; object/key limit")
     return value
 
 
@@ -63,6 +80,11 @@ def atomic_json(path: Path, payload: dict[str, Any]) -> None:
     temporary = None
     replaced = False
     try:
+        reject_symlinks(path)
+        if not isinstance(payload, dict) or len(payload) > MAX_STATE_KEYS:
+            raise PersistenceError("Authoritative state exceeds key limit")
+        if len(json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("utf-8")) + 1 > MAX_STATE_BYTES:
+            raise PersistenceError("Authoritative state exceeds byte limit")
         path.parent.mkdir(parents=True, exist_ok=True)
         descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".pending", dir=path.parent)
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
@@ -70,6 +92,7 @@ def atomic_json(path: Path, payload: dict[str, Any]) -> None:
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
+        reject_symlinks(path)
         os.replace(temporary, path)
         replaced = True
         directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
@@ -94,11 +117,17 @@ def atomic_json(path: Path, payload: dict[str, Any]) -> None:
 class RuntimeDirectoryLease:
     """Exclusive advisory lease shared by service, migration and repair tools."""
     def __init__(self, directory: Path, *, allow_migration_pending: bool = False):
+        reject_symlinks(directory / ".runtime.lock")
         directory.mkdir(parents=True, exist_ok=True)
-        self._handle = (directory / ".runtime.lock").open("a+b")
+        try:
+            descriptor = os.open(directory / ".runtime.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        except OSError as exc:
+            raise PersistenceError("Cannot acquire runtime directory lease") from exc
+        self._handle = os.fdopen(descriptor, "a+b")
         try:
             fcntl.flock(self._handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            if not allow_migration_pending and (directory / "migration_pending.json").exists():
+            marker = directory / "migration_pending.json"
+            if not allow_migration_pending and (marker.exists() or marker.is_symlink()):
                 raise PersistenceError("Runtime migration is pending; resume or recover migration before startup")
         except Exception:
             self.close()

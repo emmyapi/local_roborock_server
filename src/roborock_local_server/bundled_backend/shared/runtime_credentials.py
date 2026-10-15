@@ -14,7 +14,7 @@ from typing import Any
 from urllib.parse import parse_qs
 
 from .data_helpers import utcnow_iso
-from .durable_state import atomic_json, load_json_object, PersistenceError, PersistenceUncertainError
+from .durable_state import atomic_json, load_json_object, PersistenceError, PersistenceUncertainError, MAX_STATE_KEYS
 
 
 def _clean_str(value: Any) -> str:
@@ -232,8 +232,6 @@ class RuntimeCredentialsStore:
         self._load()
 
     def _load(self) -> None:
-        if not self.path.exists():
-            return
         parsed = load_json_object(self.path)
         if parsed.get("schema_version", 2) not in (1, 2):
             raise PersistenceError("Unsupported runtime credentials schema")
@@ -241,7 +239,13 @@ class RuntimeCredentialsStore:
             raise PersistenceError("Invalid runtime credential devices")
         for key in self._BASE_KEYS:
             if key in parsed:
-                self._base[key] = parsed[key]
+                value = parsed[key]
+                if key.endswith("_port"):
+                    if type(value) is not int:
+                        raise PersistenceError("Runtime credential ports must be integers")
+                elif not isinstance(value, str):
+                    raise PersistenceError("Runtime credential fields must be strings")
+                self._base[key] = value
 
         raw_devices = parsed.get("devices")
         if isinstance(raw_devices, dict):
@@ -251,10 +255,14 @@ class RuntimeCredentialsStore:
         else:
             raw_items = []
 
+        if len(raw_items) > MAX_STATE_KEYS:
+            raise PersistenceError("Runtime credentials exceed device limit")
         loaded: list[dict[str, str]] = []
         for raw in raw_items:
             if not isinstance(raw, dict):
                 raise PersistenceError("Invalid runtime credential device")
+            if any(not isinstance(value, str) for value in raw.values()):
+                raise PersistenceError("Runtime credential fields must be strings")
             normalized = self._normalize_device(raw)
             if not normalized:
                 raise PersistenceError("Runtime credential device has no identity")
@@ -289,6 +297,8 @@ class RuntimeCredentialsStore:
         payload["schema_version"] = 2
         payload["updated_at"] = utcnow_iso()
         payload["devices"] = self.devices()
+        if len(payload["devices"]) > MAX_STATE_KEYS:
+            raise PersistenceError("Runtime credentials exceed device limit")
         atomic_json(self.path, payload)
 
     def bootstrap_value(self, key: str, default: Any = "") -> Any:

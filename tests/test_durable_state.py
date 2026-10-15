@@ -83,12 +83,12 @@ def test_corrupt_credential_authority_fails_closed(tmp_path, contents):
 def test_unreadable_authority_is_not_empty(tmp_path, monkeypatch):
     path = tmp_path / "credentials.json"
     path.write_text("{}")
-    original = Path.open
-    def denied(self, *args, **kwargs):
-        if self == path:
+    original = os.open
+    def denied(target, *args, **kwargs):
+        if target == path:
             raise PermissionError("synthetic")
-        return original(self, *args, **kwargs)
-    monkeypatch.setattr(Path, "open", denied)
+        return original(target, *args, **kwargs)
+    monkeypatch.setattr(os, "open", denied)
     with pytest.raises(durable.PersistenceError):
         RuntimeCredentialsStore(path)
 
@@ -110,7 +110,8 @@ def test_zone_response_publishes_one_batch_with_assigned_ids(tmp_path, monkeypat
     assert store.get("assigned", 9) == [10,20,30,40]
     assert store.get("assigned", 10) == [50,60,70,80]
     assert ZoneRangesStore(tmp_path).get("existing", 1) == [1,2,3,4]
-    store.merge_set_scenes_zones_response(request, [{"zones": [{"zid": 5}]}])
+    with pytest.raises(durable.PersistenceError):
+        store.merge_set_scenes_zones_response(request, [{"zones": [{"zid": 5}]}])
     assert len(calls) == 1
 
 
@@ -139,3 +140,58 @@ def test_partial_store_blocks_missing_scene_zone_without_log_reads(tmp_path):
     hydrated, changed = _hydrate_scene_param_with_zone_ranges(SimpleNamespace(zone_ranges_store=store), payload)
     assert changed
     assert hydrated["action"]["items"][0]["param"]["params"]["data"][0]["zones"][1]["range"] == [5,6,7,8]
+
+
+@pytest.mark.parametrize("dangling", [False, True])
+def test_authority_and_lease_symlinks_rejected_without_touching_target(tmp_path, dangling):
+    target = tmp_path / "target.json"
+    if not dangling:
+        target.write_text('{"original":true}')
+    path = tmp_path / "credentials.json"
+    path.symlink_to(target)
+    for operation in (lambda: durable.load_json_object(path), lambda: durable.atomic_json(path, {"changed": True}), lambda: RuntimeCredentialsStore(path)):
+        with pytest.raises(durable.PersistenceError):
+            operation()
+    if not dangling:
+        assert target.read_text() == '{"original":true}'
+    else:
+        assert not target.exists()
+    lock = tmp_path / ".runtime.lock"
+    lock.symlink_to(target)
+    with pytest.raises(durable.PersistenceError):
+        durable.RuntimeDirectoryLease(tmp_path)
+
+
+@pytest.mark.parametrize("coords", [[1,2,3], [1,2,3,4,5], [True,2,3,4], [1.0,2,3,4], ["1",2,3,4]])
+def test_malformed_numeric_zones_cannot_partially_publish(tmp_path, coords):
+    store = ZoneRangesStore(tmp_path)
+    store.put("old", 1, [1,2,3,4])
+    before = (tmp_path / "zone_ranges.json").read_bytes()
+    with pytest.raises(durable.PersistenceError):
+        store.put("new", 2, coords)
+    request = {"data": [{"zones": [{"range":[1,2,3,4]}, {"range":coords}]}]}
+    response = [{"tid":"assigned", "zones":[{"zid":2}, {"zid":3}]}]
+    with pytest.raises(durable.PersistenceError):
+        store.merge_set_scenes_zones_response(request, response)
+    assert (tmp_path / "zone_ranges.json").read_bytes() == before
+    assert store.get_all() == {("old", 1): [1,2,3,4]}
+
+
+@pytest.mark.parametrize("field,value", [("did", 123), ("device_mqtt_pass", True), ("localkey", ["secret"])])
+def test_nonstrings_in_authoritative_credentials_rejected(tmp_path, field, value):
+    path = tmp_path / "credentials.json"
+    path.write_text(json.dumps({"schema_version": 2, "devices": [{"did":"known", field:value}]}))
+    with pytest.raises(durable.PersistenceError):
+        RuntimeCredentialsStore(path)
+
+
+def test_authority_byte_and_key_limits(tmp_path, monkeypatch):
+    monkeypatch.setattr(durable, "MAX_STATE_BYTES", 32)
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({"text":"x" * 40}))
+    with pytest.raises(durable.PersistenceError): durable.load_json_object(path)
+    with pytest.raises(durable.PersistenceError): durable.atomic_json(path, {"text":"x" * 40})
+    monkeypatch.setattr(durable, "MAX_STATE_KEYS", 1)
+    path.write_text('{"a":1,"b":2}')
+    with pytest.raises(durable.PersistenceError): durable.load_json_object(path)
+    with pytest.raises(durable.PersistenceError): durable.atomic_json(path, {"a":1,"b":2})
