@@ -191,3 +191,45 @@ def test_numeric_assigned_tid_has_legacy_canonical_identity():
     for invalid in (True, 1.5, [], {}):
         with pytest.raises(MigrationError):
             zone_key(invalid, 7)
+
+
+@pytest.mark.parametrize('missing', ['tid', 'zid'])
+def test_success_without_assigned_identity_never_recovers(missing):
+    from roborock_local_server.legacy_migration import response_zones
+    value = response()['decoded_messages'][0]['response_to']
+    if missing == 'tid':
+        del value['result'][0]['tid']
+    else:
+        del value['result'][0]['zones'][0]['zid']
+    with pytest.raises(MigrationError):
+        response_zones(value)
+
+
+def test_oversized_current_store_never_becomes_startup_rejecting_candidate(tmp_path):
+    data, output = fixture(tmp_path)
+    write_log(data, [response(7), response(8)])
+    (data / 'zone_ranges.json').write_text(json.dumps({f't:{i}': [1, 2, 3, 4] for i in range(10001)}))
+    with pytest.raises(MigrationError):
+        prepare(data, output)
+    assert not (output / 'journal.json').exists()
+
+
+def test_invalid_authoritative_field_cannot_bypass_runtime_schema(tmp_path):
+    data, output = fixture(tmp_path)
+    write_log(data, [response(7), response(8)])
+    value=json.loads((data/'runtime_credentials.json').read_text())
+    value['api_host']=123
+    (data/'runtime_credentials.json').write_text(json.dumps(value))
+    with pytest.raises(MigrationError, match='runtime schema'):
+        prepare(data, output)
+    assert not (output / 'journal.json').exists()
+
+
+def test_output_symlink_refused_without_chmod_external_target(tmp_path):
+    data, output = fixture(tmp_path)
+    target=tmp_path/'external'; target.mkdir(mode=0o755)
+    output.symlink_to(target, target_is_directory=True)
+    with pytest.raises(MigrationError, match='symlink'):
+        prepare(data, output)
+    assert target.stat().st_mode & 0o777 == 0o755
+    assert not list(target.iterdir())

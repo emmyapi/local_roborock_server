@@ -23,7 +23,13 @@ class MigrationError(RuntimeError):
     pass
 
 
+def reject_path(path: Path) -> None:
+    if any(candidate.is_symlink() for candidate in (path, *path.parents)):
+        raise MigrationError('symlink path component refused')
+
+
 def digest(path: Path) -> str:
+    reject_path(path)
     h = hashlib.sha256()
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     with os.fdopen(fd, 'rb') as stream:
@@ -35,6 +41,7 @@ def digest(path: Path) -> str:
 
 
 def atomic_json(path: Path, value: Any) -> None:
+    reject_path(path)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     if path.is_symlink():
         raise MigrationError('symlink destination refused')
@@ -58,6 +65,7 @@ def atomic_json(path: Path, value: Any) -> None:
 
 
 def read_json(path: Path, *, absent: Any = None) -> Any:
+    reject_path(path)
     if path.is_symlink():
         raise MigrationError('symlink source refused')
     try:
@@ -182,12 +190,16 @@ def response_zones(response: dict[str, Any]) -> dict[str, list[int]]:
                 raise MigrationError('malformed recovery-bearing zone')
             if 'range' not in req_zone:
                 continue
-            key = zone_key(result.get('tid') or request.get('tid'), res_zone.get('zid', req_zone.get('zid')))
+            key = zone_key(result.get('tid'), res_zone.get('zid'))
             found[key] = coords(req_zone['range'])
     return found
 
 
 def _prepare(data: Path, output: Path, *, audit: bool = False) -> dict[str, Any]:
+    reject_path(data)
+    reject_path(output)
+    if output.resolve() == data.resolve() or data.resolve() in output.resolve().parents:
+        raise MigrationError('candidate output must be outside runtime directory')
     output.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(output, 0o700)
     if (output / 'journal.json').exists():
@@ -201,7 +213,7 @@ def _prepare(data: Path, output: Path, *, audit: bool = False) -> dict[str, Any]
     devices = credentials.get('devices')
     if isinstance(devices, dict):
         devices = list(devices.values())
-    if not isinstance(devices, list) or not devices:
+    if not isinstance(devices, list) or not devices or len(devices) > MAX_KEYS:
         raise MigrationError('known device identities unavailable')
     for device in devices:
         if not isinstance(device, dict) or not (device.get('did') or device.get('duid')) or any(not isinstance(device.get(k), str) or not device[k] for k in ('localkey', 'device_mqtt_usr', 'device_mqtt_pass')):
@@ -209,7 +221,7 @@ def _prepare(data: Path, output: Path, *, audit: bool = False) -> dict[str, Any]
     inventory = read_json(inventory_path)
     required, embedded = required_zones(inventory)
     current = read_json(zones_path, absent={})
-    if not isinstance(current, dict):
+    if not isinstance(current, dict) or len(current) > MAX_KEYS:
         raise MigrationError('invalid zone store')
     for key, value in current.items():
         if not isinstance(key, str):
@@ -256,6 +268,8 @@ def _prepare(data: Path, output: Path, *, audit: bool = False) -> dict[str, Any]
     merged = dict(history)
     merged.update(embedded)
     merged.update(current)
+    if len(merged) > MAX_KEYS:
+        raise MigrationError('candidate zone key limit exceeded')
     conflicts = sum(key in embedded and key in current and embedded[key] != current[key] for key in required)
     missing = required - merged.keys()
     if missing or conflicts:
@@ -283,6 +297,14 @@ def _prepare(data: Path, output: Path, *, audit: bool = False) -> dict[str, Any]
                 sources[path.name]['payload_sha256'] = payload_digest(initial_state[path])
     for name, value in candidates.items():
         atomic_json(output / name, value)
+    from roborock_local_server.bundled_backend.shared.runtime_credentials import RuntimeCredentialsStore
+    from roborock_local_server.bundled_backend.shared.zone_ranges_store import ZoneRangesStore
+    from roborock_local_server.bundled_backend.shared.durable_state import PersistenceError
+    try:
+        RuntimeCredentialsStore(output / 'runtime_credentials.json')
+        ZoneRangesStore(output)
+    except PersistenceError as exc:
+        raise MigrationError('candidate does not satisfy authoritative runtime schema') from exc
     journal = {'version': VERSION, 'phase': 'prepared', 'data_directory': str(data.resolve()), 'sources': sources, 'candidates': {name: digest(output / name) for name in candidates}, 'counts': {'records': count, 'devices': len(devices), 'required_zones': len(required), 'zones': len(merged)}, 'retired_logs': []}
     atomic_json(output / 'journal.json', journal)
     return journal
@@ -431,6 +453,8 @@ def _retire(data: Path, output: Path, *, writers_stopped: bool) -> dict[str, Any
 
 def _leased(operation, data: Path, output: Path, **kwargs):
     from roborock_local_server.bundled_backend.shared.durable_state import RuntimeDirectoryLease, PersistenceError
+    reject_path(data)
+    reject_path(output)
     try:
         with RuntimeDirectoryLease(data, allow_migration_pending=operation is not _prepare):
             return operation(data, output, **kwargs)
