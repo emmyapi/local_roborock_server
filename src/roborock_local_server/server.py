@@ -53,6 +53,8 @@ from https_server.routes.auth.service import (
     with_current_server_urls,
 )
 from .bundled_backend.shared.zone_ranges_store import ZoneRangesStore
+from .bundled_backend.shared.durable_state import RuntimeDirectoryLease, durable_state_status
+from .bundled_backend.shared.io_utils import close_log_writers, diagnostic_log_status
 from .security import AdminSessionManager, verify_password
 
 
@@ -302,7 +304,16 @@ def _seed_runtime_vacuums_from_credentials(
 class ReleaseSupervisor:
     """Owns the release stack lifecycle."""
 
-    def __init__(
+    def __init__(self, *, config: AppConfig, paths: AppPaths, enable_standalone_admin: bool = True) -> None:
+        self._runtime_lease = RuntimeDirectoryLease(paths.runtime_dir)
+        try:
+            self._initialize(config=config, paths=paths, enable_standalone_admin=enable_standalone_admin)
+        except BaseException:
+            close_log_writers()
+            self._runtime_lease.close()
+            raise
+
+    def _initialize(
         self,
         *,
         config: AppConfig,
@@ -400,11 +411,12 @@ class ReleaseSupervisor:
             mqtt_backend_port=self.config.broker.port,
         )
         self.runtime_credentials.sync_inventory()
-        recovered_device_passwords = self.runtime_credentials.backfill_device_mqtt_passwords(
-            self.paths.runtime_dir / "mqtt_server.log"
-        )
-        if recovered_device_passwords:
-            self.root_logger.info("Recovered %d device MQTT password(s) from mqtt_server.log", recovered_device_passwords)
+        pending_credentials = self.runtime_credentials.recovery_pending_devices()
+        if pending_credentials:
+            self.root_logger.warning(
+                "%d device credential(s) require explicit runtime-state migration or re-onboarding",
+                len(pending_credentials),
+            )
 
         self.context = ServerContext(
             api_host=self.config.network.stack_fqdn,
@@ -433,12 +445,7 @@ class ReleaseSupervisor:
         self.app = self._create_app()
 
     def _init_zone_ranges_store(self) -> ZoneRangesStore:
-        store = ZoneRangesStore(self.paths.http_jsonl_path.parent)
-        if not store._data:
-            added = store.seed_from_mqtt_jsonl(self.paths.mqtt_jsonl_path)
-            if added:
-                self.root_logger.info("Seeded zone ranges store with %d entries from MQTT log", added)
-        return store
+        return ZoneRangesStore(self.paths.http_jsonl_path.parent)
 
     def _setup_loggers(self) -> dict[str, logging.Logger]:
         self.paths.runtime_dir.mkdir(parents=True, exist_ok=True)
@@ -1330,6 +1337,16 @@ class ReleaseSupervisor:
         health["connected_vacuums"] = [vac for vac in merged_vacuums if vac.get("connected")]
         return {
             "health": health,
+            "diagnostics": {
+                "logging": diagnostic_log_status(),
+                "durable_state": durable_state_status(),
+                "traffic": {
+                    "last_device_mqtt_seen_at": max(
+                        (device.get("last_mqtt_seen_at", "") for device in self.runtime_credentials.devices()),
+                        default="",
+                    ),
+                },
+            },
             "auth": self._auth_payload(),
             "pairing": self.runtime_state.pairing_snapshot(),
             "support": PROJECT_SUPPORT,
@@ -1658,6 +1675,13 @@ class ReleaseSupervisor:
                 self.root_logger.warning("TLS renewal check failed: %s", exc)
 
     async def start(self) -> None:
+        try:
+            await self._start_services()
+        except BaseException:
+            await self.stop()
+            raise
+
+    async def _start_services(self) -> None:
         for path in (self.paths.data_dir, self.paths.runtime_dir, self.paths.state_dir, self.paths.certs_dir, self.paths.acme_dir):
             path.mkdir(parents=True, exist_ok=True)
 
@@ -1714,6 +1738,13 @@ class ReleaseSupervisor:
             self._renew_task = asyncio.create_task(self._renew_loop(), name="tls-renew-loop")
 
     async def stop(self) -> None:
+        try:
+            await self._stop_services()
+        finally:
+            close_log_writers()
+            self._runtime_lease.close()
+
+    async def _stop_services(self) -> None:
         self._stop_event.set()
         if self._renew_task is not None:
             self._renew_task.cancel()
@@ -1744,7 +1775,11 @@ class ReleaseSupervisor:
             self._broker = None
 
     async def serve_forever(self) -> int:
-        await self.start()
+        try:
+            await self.start()
+        except BaseException:
+            await self.stop()
+            raise
 
         def request_shutdown() -> None:
             if not self._stop_event.is_set():
@@ -1776,6 +1811,13 @@ async def run_server(*, config_file: Path, enable_standalone_admin: bool = True)
 
 
 def repair_runtime_identities(*, config_file: Path, links: list[str]) -> int:
+    config = load_config(config_file)
+    paths = resolve_paths(config_file, config)
+    with RuntimeDirectoryLease(paths.runtime_dir):
+        return _repair_runtime_identities_locked(config_file=config_file, links=links)
+
+
+def _repair_runtime_identities_locked(*, config_file: Path, links: list[str]) -> int:
     config = load_config(config_file)
     paths = resolve_paths(config_file, config)
     runtime_credentials = RuntimeCredentialsStore(

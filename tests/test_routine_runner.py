@@ -983,3 +983,43 @@ def test_wait_for_dock_settle_timeout_raises(monkeypatch) -> None:
             await client.wait_for_dock_settle(initial_delay_seconds=0.0)
 
     asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("fail_publication", [False, True])
+def test_accepted_zone_push_publishes_assigned_ids_or_fails_without_resending(tmp_path, monkeypatch, fail_publication):
+    from roborock_local_server.bundled_backend.shared.durable_state import PersistenceError
+    from roborock_local_server.bundled_backend.shared.zone_ranges_store import ZoneRangesStore
+    scene = _scene_with_zone_tid(scene_id=5, device_id="device", name="test", tid="old", zid=1, range_coords=[1,2,3,4])
+    sent = []
+    class Client:
+        def __init__(self, *args): pass
+        async def connect(self): pass
+        async def close(self): pass
+        async def wait_for_step_complete(self): pass
+        async def send_command(self, command, params=None):
+            sent.append(command)
+            return ["ok"]
+        async def send_command_await_unlock(self, command, params=None):
+            sent.append(command)
+            return [{"tid":"new", "zones":[{"zid":7}]}]
+    context = _test_context(tmp_path)
+    context.zone_ranges_store = ZoneRangesStore(tmp_path)
+    monkeypatch.setattr(routine_runner_module, "_RoutineMqttClient", Client)
+    def fail(*args, **kwargs): raise PersistenceError("synthetic disk full")
+    if fail_publication:
+        monkeypatch.setattr(context.zone_ranges_store, "merge_set_scenes_zones_response", fail)
+    runner = RoutineRunner(context)
+    async def exercise():
+        if fail_publication:
+            with pytest.raises(PersistenceError):
+                await runner._run_scene(scene=scene, steps=parse_scene_steps(scene))
+        else:
+            await runner._run_scene(scene=scene, steps=parse_scene_steps(scene))
+    asyncio.run(exercise())
+    assert sent.count("set_scenes_zones") == 1
+    if fail_publication:
+        assert "do_scenes_zones" not in sent
+    else:
+        assert sent.count("do_scenes_zones") == 1
+        assert ZoneRangesStore(tmp_path).get("new", 7) == [1,2,3,4]
+        assert context.zone_ranges_store.get("old", 1) is None

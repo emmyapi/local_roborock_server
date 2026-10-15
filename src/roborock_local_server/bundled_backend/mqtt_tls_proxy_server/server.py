@@ -333,12 +333,17 @@ class MqttTlsProxy:
             self._pop_pending_onboarding_auth(conn_id)
             self._close_conn_endpoints(conn_id)
             return False
-        learned = self.runtime_credentials.confirm_device_mqtt_credentials(
-            did=candidate.get("did", ""),
-            duid=candidate.get("duid", ""),
-            username=candidate["username"],
-            password=candidate["password"],
-        )
+        try:
+            learned = self.runtime_credentials.confirm_device_mqtt_credentials(
+                did=candidate.get("did", ""),
+                duid=candidate.get("duid", ""),
+                username=candidate["username"],
+                password=candidate["password"],
+            )
+        except Exception:
+            self._pop_pending_onboarding_auth(conn_id)
+            self._close_conn_endpoints(conn_id)
+            raise
         self._pop_pending_onboarding_auth(conn_id)
         if learned is None:
             self.logger.warning(
@@ -519,7 +524,7 @@ class MqttTlsProxy:
         if packet_type in (12, 13):  # PINGREQ, PINGRESP
             return
         packet_name = MQTT_TYPES.get(packet_type, f"TYPE_{packet_type}")
-        preview = packet[:96].hex()
+        preview = "[CONNECT omitted]" if packet_type == 1 else packet[:96].hex()
         self.logger.info("[conn %s %s] %s len=%d hex=%s", conn_id, direction, packet_name, len(packet), preview)
 
         if packet_type == 1 and direction == "c2b":
@@ -625,13 +630,6 @@ class MqttTlsProxy:
                             rpc_data.get("method"),
                             rpc_data.get("id"),
                             handled,
-                        )
-                    if (
-                        self.zone_ranges_store is not None
-                        and str(rpc_data.get("method") or "").strip() == "set_scenes_zones"
-                    ):
-                        self.zone_ranges_store.merge_set_scenes_zones_request(
-                            rpc_data.get("params"),
                         )
                 elif proto_value == 102:
                     response_to = self._command_registry.handle_response(rpc_data)

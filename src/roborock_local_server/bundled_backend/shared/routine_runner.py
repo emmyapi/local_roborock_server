@@ -286,7 +286,7 @@ def _zone_coord_params(entry: dict[str, Any]) -> list[list[int]]:
         range_value = raw_zone.get("range")
         if not isinstance(range_value, list) or len(range_value) < 4:
             raise RoutineExecutionError(
-                f"Scene zone zid={raw_zone.get('zid')} is missing range coordinates"
+                f"Scene zone zid={raw_zone.get('zid')} is missing range coordinates; restore zone_ranges.json or run explicit runtime-state migration"
             )
         repeat = max(1, _as_int(raw_zone.get("repeat"), 1))
         coords.append([
@@ -881,6 +881,15 @@ class RoutineRunner:
         scene_id = _scene_id(scene)
         scene_name = _scene_name(scene)
         steps = parse_scene_steps(scene)
+        for step in steps:
+            if step.method == "do_scenes_zones":
+                data = step.params.get("data") if isinstance(step.params, dict) else None
+                if not isinstance(data, list) or not data:
+                    raise RoutineExecutionError("Scene zone geometry is missing; restore zone_ranges.json or migrate state")
+                for entry in data:
+                    if not isinstance(entry, dict):
+                        raise RoutineExecutionError("Scene zone geometry is invalid")
+                    _zone_coord_params(entry)
         existing = self._tasks_by_device.get(device_id)
         if existing is not None:
             if existing.task.done():
@@ -1220,7 +1229,7 @@ class RoutineRunner:
                             push_method,
                             push_params,
                         )
-                        await client.send_command_await_unlock(push_method, push_params)
+                        push_result = await client.send_command_await_unlock(push_method, push_params)
                     except (RoborockUnsupportedFeature, RoborockInvalidStatus) as exc:
                         logger.info(
                             "Routine step=%s scene definition push method=%s failed (%s); "
@@ -1229,6 +1238,13 @@ class RoutineRunner:
                             push_method,
                             exc,
                         )
+                    else:
+                        if push_method == "set_scenes_zones" and self._context.zone_ranges_store is not None:
+                            # Publication is outside the device retry/fallback block.
+                            # A disk failure must never resend an accepted command.
+                            self._context.zone_ranges_store.merge_set_scenes_zones_response(
+                                request_params=push_params, result=push_result,
+                            )
                 used_native = True
                 try:
                     logger.info(

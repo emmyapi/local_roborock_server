@@ -16,6 +16,8 @@ import threading
 from pathlib import Path
 from typing import Any
 
+from .durable_state import atomic_json, load_json_object, PersistenceError, PersistenceUncertainError
+
 
 _ZONE_RANGES_FILE = "zone_ranges.json"
 
@@ -43,25 +45,26 @@ class ZoneRangesStore:
         self._data: dict[str, list[int]] = self._load()
 
     def _load(self) -> dict[str, list[int]]:
-        if not self._path.exists():
-            return {}
-        try:
-            raw = json.loads(self._path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            return {}
-        if not isinstance(raw, dict):
-            return {}
-        return {k: v for k, v in raw.items() if isinstance(v, list) and len(v) >= 4}
+        raw = load_json_object(self._path)
+        for key, value in raw.items():
+            parsed = _parse_key(key)
+            if (parsed is None or not parsed[0] or parsed[1] < 0
+                    or not isinstance(value, list) or len(value) != 4
+                    or any(type(coord) is not int for coord in value)):
+                raise PersistenceError("Invalid authoritative zone ranges; restore or migrate state")
+        return raw
 
-    def _save(self) -> None:
-        try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            self._path.write_text(
-                json.dumps(self._data, ensure_ascii=False, separators=(",", ":")),
-                encoding="utf-8",
-            )
-        except OSError:
-            pass
+    def _commit(self, updates: dict[str, list[int]]) -> None:
+        with self._lock:
+            candidate = {**self._data, **updates}
+            if candidate == self._data:
+                return
+            try:
+                atomic_json(self._path, candidate)
+            except PersistenceUncertainError:
+                self._data = self._load()
+                raise
+            self._data = candidate
 
     def get(self, tid: str, zid: int) -> list[int] | None:
         with self._lock:
@@ -86,12 +89,7 @@ class ZoneRangesStore:
         if not tid or zid < 0 or not isinstance(range_coords, list) or len(range_coords) < 4:
             return
         coords = [int(v) for v in range_coords[:4]]
-        k = _key(tid, zid)
-        with self._lock:
-            if self._data.get(k) == coords:
-                return
-            self._data[k] = coords
-            self._save()
+        self._commit({_key(tid, zid): coords})
 
     def merge_set_scenes_zones_request(self, params: Any) -> None:
         """Extract and store ranges from a set_scenes_zones RPC request."""
@@ -100,6 +98,7 @@ class ZoneRangesStore:
         data = params.get("data")
         if not isinstance(data, list):
             return
+        updates = {}
         for entry in data:
             if not isinstance(entry, dict):
                 continue
@@ -110,7 +109,8 @@ class ZoneRangesStore:
                 zid = zone.get("zid")
                 range_value = zone.get("range")
                 if tid and isinstance(zid, int) and isinstance(range_value, list) and len(range_value) >= 4:
-                    self.put(tid, zid, range_value)
+                    updates[_key(tid, zid)] = [int(v) for v in range_value[:4]]
+        self._commit(updates)
 
     def seed_from_mqtt_jsonl(self, mqtt_jsonl: Path) -> int:
         """Populate the store from an existing MQTT JSONL log file.
@@ -161,10 +161,11 @@ class ZoneRangesStore:
         request_data = request_params.get("data")
         if not isinstance(request_data, list):
             return
+        updates = {}
         for req_entry, res_entry in zip(request_data, result):
             if not isinstance(req_entry, dict) or not isinstance(res_entry, dict):
                 continue
-            tid = str(res_entry.get("tid") or req_entry.get("tid") or "").strip()
+            tid = str(res_entry.get("tid") or "").strip()
             if not tid:
                 continue
             req_zones = req_entry.get("zones") or []
@@ -173,7 +174,8 @@ class ZoneRangesStore:
                 if not isinstance(req_zone, dict):
                     continue
                 res_zone = res_zones[idx] if idx < len(res_zones) and isinstance(res_zones[idx], dict) else {}
-                zid = res_zone.get("zid", req_zone.get("zid"))
+                zid = res_zone.get("zid")
                 range_value = req_zone.get("range")
-                if isinstance(zid, int) and isinstance(range_value, list) and len(range_value) >= 4:
-                    self.put(tid, zid, range_value)
+                if type(zid) is int and zid >= 0 and isinstance(range_value, list) and len(range_value) >= 4:
+                    updates[_key(tid, zid)] = [int(v) for v in range_value[:4]]
+        self._commit(updates)

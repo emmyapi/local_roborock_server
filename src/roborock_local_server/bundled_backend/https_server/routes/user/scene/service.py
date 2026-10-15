@@ -161,53 +161,6 @@ def _merge_scene_zone_ranges_from_response(
             zone_ranges[key] = range_value
 
 
-def _scene_zone_ranges_from_mqtt(
-    ctx: ServerContext,
-    *,
-    tids_filter: set[str] | None = None,
-) -> dict[tuple[str, int], list[int]]:
-    path = ctx.mqtt_jsonl
-    if not path.exists():
-        return {}
-    zone_ranges: dict[tuple[str, int], list[int]] = {}
-    try:
-        with path.open("r", encoding="utf-8") as handle:
-            lines = handle.readlines()
-        for line in reversed(lines):
-            try:
-                entry = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            decoded_messages = entry.get("decoded_messages")
-            if not isinstance(decoded_messages, list):
-                continue
-            for decoded in decoded_messages:
-                if not isinstance(decoded, dict):
-                    continue
-                rpc = decoded.get("rpc")
-                if isinstance(rpc, dict) and str(rpc.get("method") or "").strip() == "set_scenes_zones":
-                    _merge_scene_zone_ranges_from_request(
-                        zone_ranges,
-                        params=rpc.get("params"),
-                        tids_filter=tids_filter,
-                    )
-                response_to = decoded.get("response_to")
-                if isinstance(response_to, dict) and str(response_to.get("request_method") or "").strip() == "set_scenes_zones":
-                    _merge_scene_zone_ranges_from_response(
-                        zone_ranges,
-                        request_params=response_to.get("request_params"),
-                        result=response_to.get("result"),
-                        tids_filter=tids_filter,
-                    )
-            if tids_filter and all(
-                any(key[0] == tid for key in zone_ranges) for tid in tids_filter
-            ):
-                break
-    except OSError:
-        return {}
-    return zone_ranges
-
-
 def _scene_zone_tids(param_payload: dict[str, Any]) -> set[str]:
     action = param_payload.get("action")
     items = action.get("items") if isinstance(action, dict) else []
@@ -260,10 +213,6 @@ def _hydrate_scene_param_with_zone_ranges(
     if not tids:
         return param_payload, False
     zone_ranges = _scene_zone_ranges_from_store(ctx, tids_filter=tids)
-    if not zone_ranges:
-        zone_ranges = _scene_zone_ranges_from_mqtt(ctx, tids_filter=tids)
-    if not zone_ranges:
-        return param_payload, False
     try:
         hydrated_payload = json.loads(_scene_param_json_string(param_payload))
     except (TypeError, ValueError):
@@ -315,6 +264,12 @@ def _hydrate_scene_param_with_zone_ranges(
                     continue
                 range_value = zone_ranges.get((tid, as_int(zone.get("zid"), -1)))
                 if range_value is None:
+                    existing = zone.get("range")
+                    if not isinstance(existing, list) or len(existing) < 4:
+                        raise RoutineExecutionError(
+                            f"Scene zone tid={tid} zid={zone.get('zid')} is missing durable geometry; "
+                            "restore zone_ranges.json or run explicit runtime-state migration before retrying"
+                        )
                     new_zones.append(zone)
                     continue
                 new_zone = dict(zone)
@@ -468,15 +423,9 @@ def _hydrate_inventory_scene_ranges(ctx: ServerContext, scene: dict[str, Any]) -
     tids = _scene_zone_tids(param_payload)
     hydrated_payload, changed = _hydrate_scene_param_with_zone_ranges(ctx, param_payload)
     if not changed:
-        if tids:
-            _LOGGER.warning(
-                "Scene %s has zone tids %s but no range data was hydrated from MQTT log",
-                scene_id,
-                tids,
-            )
         return scene
 
-    _LOGGER.info("Scene %s: hydrated zone ranges for tids %s from MQTT log", scene_id, tids)
+    _LOGGER.info("Scene %s: hydrated zone ranges for tids %s from durable state", scene_id, tids)
 
     def apply_update(updated_scene: dict[str, Any], inventory: dict[str, Any]) -> None:
         _ = inventory

@@ -85,7 +85,7 @@ def _after_dinner_param_payload(device_id: str, *, include_ranges: bool) -> dict
     }
 
 
-def _write_scene_zone_trace(mqtt_jsonl_path: Path) -> None:
+def _write_durable_scene_zones(mqtt_jsonl_path: Path) -> None:
     mqtt_jsonl_path.parent.mkdir(parents=True, exist_ok=True)
     entries = [
         {
@@ -141,10 +141,12 @@ def _write_scene_zone_trace(mqtt_jsonl_path: Path) -> None:
             ]
         },
     ]
-    mqtt_jsonl_path.write_text(
-        "\n".join(json.dumps(entry, separators=(",", ":")) for entry in entries) + "\n",
-        encoding="utf-8",
-    )
+    from roborock_local_server.bundled_backend.shared.zone_ranges_store import ZoneRangesStore
+    store = ZoneRangesStore(mqtt_jsonl_path.parent)
+    for entry in entries:
+        response = entry["decoded_messages"][0]["response_to"]
+        store.merge_set_scenes_zones_response(response["request_params"], response["result"])
+
 
 
 def _seed_protocol_snapshot(path: Path) -> None:
@@ -971,7 +973,7 @@ def test_scene_update_routes_persist_name_and_zone_ranges(tmp_path: Path) -> Non
         encoding="utf-8",
     )
     _seed_protocol_snapshot(paths.cloud_snapshot_path)
-    _write_scene_zone_trace(paths.mqtt_jsonl_path)
+    _write_durable_scene_zones(paths.mqtt_jsonl_path)
 
     supervisor = ReleaseSupervisor(config=config, paths=paths)
     client = TestClient(supervisor.app)
@@ -1094,7 +1096,7 @@ def test_post_scene_create_accepts_hawk_json_body_signature(tmp_path: Path) -> N
         encoding="utf-8",
     )
     _seed_protocol_snapshot(paths.cloud_snapshot_path)
-    _write_scene_zone_trace(paths.mqtt_jsonl_path)
+    _write_durable_scene_zones(paths.mqtt_jsonl_path)
 
     supervisor = ReleaseSupervisor(config=config, paths=paths)
     client = TestClient(supervisor.app)
@@ -1208,7 +1210,7 @@ def test_shared_device_query_routes_return_rooms_and_received_devices(tmp_path: 
         {"id": 10283928, "name": "Kitchen"},
         {"id": 10283924, "name": "Living room"},
     ]
-def test_execute_scene_hydrates_missing_zone_ranges_from_mqtt(tmp_path: Path) -> None:
+def test_execute_scene_hydrates_missing_zone_ranges_from_durable_store_without_logs(tmp_path: Path) -> None:
     config_file = write_release_config(tmp_path)
     config = load_config(config_file)
     paths = resolve_paths(config_file, config)
@@ -1242,7 +1244,7 @@ def test_execute_scene_hydrates_missing_zone_ranges_from_mqtt(tmp_path: Path) ->
         + "\n",
         encoding="utf-8",
     )
-    _write_scene_zone_trace(paths.mqtt_jsonl_path)
+    _write_durable_scene_zones(paths.mqtt_jsonl_path)
 
     captured_scene: dict[str, object] = {}
 
@@ -1278,3 +1280,22 @@ def test_execute_scene_hydrates_missing_zone_ranges_from_mqtt(tmp_path: Path) ->
     persisted_outer = json.loads(scene["param"])
     persisted_step = json.loads(persisted_outer["action"]["items"][0]["param"])
     assert persisted_step["params"]["data"][0]["zones"][0]["range"] == [32800, 22750, 34550, 25350]
+
+
+def test_authenticated_status_reports_live_process_diagnostic_counters(tmp_path: Path) -> None:
+    from roborock_local_server.bundled_backend.shared import durable_state
+    from roborock_local_server.bundled_backend.shared.io_utils import diagnostic_log_status
+    config_file = write_release_config(tmp_path)
+    config = load_config(config_file)
+    paths = resolve_paths(config_file, config)
+    supervisor = ReleaseSupervisor(config=config, paths=paths)
+    client = TestClient(supervisor.app)
+    assert client.get("/admin/api/status").status_code == 401
+    client.post("/admin/api/login", json={"password": "correct horse battery staple"})
+    before = client.get("/admin/api/status").json()["diagnostics"]
+    durable_state.PersistenceError("synthetic")
+    after = client.get("/admin/api/status").json()["diagnostics"]
+    assert before["durable_state"]["incarnation"] == after["durable_state"]["incarnation"]
+    assert after["durable_state"]["persistence_errors"] == before["durable_state"]["persistence_errors"] + 1
+    assert after["logging"] == diagnostic_log_status()
+    assert after["durable_state"]["process_id"] > 0

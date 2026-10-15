@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from collections import Counter
+from copy import deepcopy
+from functools import wraps
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -12,6 +14,7 @@ from typing import Any
 from urllib.parse import parse_qs
 
 from .data_helpers import utcnow_iso
+from .durable_state import atomic_json, load_json_object, PersistenceError, PersistenceUncertainError
 
 
 def _clean_str(value: Any) -> str:
@@ -172,6 +175,27 @@ def parse_mqtt_connect_packet(packet: bytes) -> dict[str, Any] | None:
     }
 
 
+
+def _transaction(method):
+    """Keep speculative mutations private until durable publication succeeds."""
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with self._lock:
+            before = deepcopy((self._base, self._devices))
+            try:
+                return method(self, *args, **kwargs)
+            except PersistenceUncertainError:
+                # Disk now names the replacement. Reconcile exact visible state,
+                # but never acknowledge this operation as durably successful.
+                self._base = {"schema_version": 2}
+                self._devices = []
+                self._load()
+                raise
+            except Exception:
+                self._base, self._devices = before
+                raise
+    return wrapped
+
 class RuntimeCredentialsStore:
     """Persists stack credentials and per-device onboarding keys."""
 
@@ -210,7 +234,11 @@ class RuntimeCredentialsStore:
     def _load(self) -> None:
         if not self.path.exists():
             return
-        parsed = _load_json(self.path)
+        parsed = load_json_object(self.path)
+        if parsed.get("schema_version", 2) not in (1, 2):
+            raise PersistenceError("Unsupported runtime credentials schema")
+        if "devices" in parsed and not isinstance(parsed["devices"], (list, dict)):
+            raise PersistenceError("Invalid runtime credential devices")
         for key in self._BASE_KEYS:
             if key in parsed:
                 self._base[key] = parsed[key]
@@ -226,8 +254,10 @@ class RuntimeCredentialsStore:
         loaded: list[dict[str, str]] = []
         for raw in raw_items:
             if not isinstance(raw, dict):
-                continue
+                raise PersistenceError("Invalid runtime credential device")
             normalized = self._normalize_device(raw)
+            if not normalized:
+                raise PersistenceError("Runtime credential device has no identity")
             if normalized:
                 loaded.append(normalized)
         self._devices = loaded
@@ -259,13 +289,13 @@ class RuntimeCredentialsStore:
         payload["schema_version"] = 2
         payload["updated_at"] = utcnow_iso()
         payload["devices"] = self.devices()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        atomic_json(self.path, payload)
 
     def bootstrap_value(self, key: str, default: Any = "") -> Any:
         with self._lock:
             return self._base.get(key, default)
 
+    @_transaction
     def update_base(self, **kwargs: Any) -> None:
         with self._lock:
             changed = False
@@ -387,6 +417,7 @@ class RuntimeCredentialsStore:
     def _generate_localkey() -> str:
         return secrets.token_hex(8)
 
+    @_transaction
     def ensure_device(
         self,
         *,
@@ -485,6 +516,7 @@ class RuntimeCredentialsStore:
                 self._save_locked()
             return dict(device)
 
+    @_transaction
     def link_did_to_duid(
         self,
         *,
@@ -636,6 +668,7 @@ class RuntimeCredentialsStore:
                 return False, "invalid_device_mqtt_password", dict(device)
         return False, "unknown_device_mqtt_username", None
 
+    @_transaction
     def recover_device_mqtt_password(self, *, username: str, password: str) -> dict[str, str] | None:
         normalized_username = _clean_str(username)
         normalized_password = _clean_str(password)
@@ -653,6 +686,7 @@ class RuntimeCredentialsStore:
                 return dict(device)
         return None
 
+    @_transaction
     def confirm_device_mqtt_credentials(
         self,
         *,
@@ -700,6 +734,7 @@ class RuntimeCredentialsStore:
         pending.sort(key=lambda item: (item.get("name") or "", item.get("duid") or item.get("did") or ""))
         return pending
 
+    @_transaction
     def backfill_device_mqtt_passwords(self, log_path: str | Path) -> int:
         path = Path(log_path)
         if not path.exists():
@@ -753,6 +788,7 @@ class RuntimeCredentialsStore:
                 self._save_locked()
         return changed
 
+    @_transaction
     def sync_inventory(self) -> None:
         inventory_devices = self._load_inventory_devices()
         key_models_by_did = self._load_key_models_by_did()

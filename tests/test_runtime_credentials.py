@@ -114,3 +114,25 @@ def test_backfill_device_mqtt_passwords_updates_only_known_usernames(tmp_path: P
     device = store.resolve_device(duid="cloud-q7-a")
     assert device is not None
     assert device["device_mqtt_pass"] == "ff8922d24a9a9af81f18f35dcee9a5a5"
+
+
+def test_confirm_credentials_failed_publication_preserves_previous_state(tmp_path, monkeypatch):
+    import pytest
+    from roborock_local_server.bundled_backend.shared import runtime_credentials as module
+    from roborock_local_server.bundled_backend.shared.durable_state import PersistenceError
+    path = tmp_path / "credentials.json"
+    store = RuntimeCredentialsStore(path)
+    store.ensure_device(did="known", duid="known-duid", model="test")
+    before = store.devices()
+    disk_before = path.read_bytes()
+    def fail(*args):
+        raise PersistenceError("synthetic disk full")
+    with monkeypatch.context() as patch:
+        patch.setattr(module, "atomic_json", fail)
+        with pytest.raises(PersistenceError):
+            store.confirm_device_mqtt_credentials(did="known", username="confirmed", password="confirmed-secret")
+    assert store.devices() == before
+    assert path.read_bytes() == disk_before
+    confirmed = store.confirm_device_mqtt_credentials(did="known", username="confirmed", password="confirmed-secret")
+    assert confirmed["device_mqtt_pass"] == "confirmed-secret"
+    assert RuntimeCredentialsStore(path).resolve_device(did="known")["device_mqtt_pass"] == "confirmed-secret"
