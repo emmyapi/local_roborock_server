@@ -233,3 +233,61 @@ def test_output_symlink_refused_without_chmod_external_target(tmp_path):
         prepare(data, output)
     assert target.stat().st_mode & 0o777 == 0o755
     assert not list(target.iterdir())
+
+
+@pytest.mark.parametrize('mutation', ['replace', 'truncate'])
+def test_source_identity_and_truncation_invalidate_preparation(tmp_path, mutation):
+    data, output = fixture(tmp_path)
+    write_log(data, [response(7), response(8)])
+    prepare(data, output)
+    path = data / 'decompiled_mqtt.jsonl'
+    if mutation == 'replace':
+        replacement=data/'replacement'; replacement.write_bytes(path.read_bytes()); replacement.replace(path)
+    else:
+        path.write_bytes(b'{}\n')
+    with pytest.raises(MigrationError, match='source changed'):
+        apply(data, output, writers_stopped=True)
+    assert not (data/'migration_pending.json').exists()
+
+
+@pytest.mark.parametrize('phase', ['prepared','writers_stopped','candidates_validated','state_installed','logs_retiring','logs_retired','credential_installed','first_log_renamed'])
+def test_abrupt_process_exit_reconciles_each_journal_boundary(tmp_path, phase):
+    import os, subprocess, sys
+    from roborock_local_server.legacy_migration import retire
+    data, output = fixture(tmp_path)
+    write_log(data, [response(7), response(8)])
+    (data/'mqtt_server.log').write_text('synthetic legacy diagnostic\n')
+    inode=(data/'mqtt_server.log').stat().st_ino
+    if phase != 'prepared':
+        prepare(data, output)
+    mode='prepare' if phase=='prepared' else 'apply'
+    if phase in ('logs_retiring','logs_retired','first_log_renamed'):
+        apply(data, output, writers_stopped=True); mode='retire'
+    code="""import os,sys
+from pathlib import Path
+import roborock_local_server.legacy_migration as migration
+data,output,phase,mode=Path(sys.argv[1]),Path(sys.argv[2]),sys.argv[3],sys.argv[4]
+real=migration.atomic_json
+def interrupted(path,value):
+    real(path,value)
+    if (path.name=='journal.json' and value.get('phase')==phase) or (phase=='credential_installed' and path==data/'runtime_credentials.json'):
+        os._exit(73)
+migration.atomic_json=interrupted
+real_rename=migration.os.rename
+def interrupted_rename(source,target):
+    real_rename(source,target)
+    if phase=='first_log_renamed': os._exit(73)
+migration.os.rename=interrupted_rename
+if mode=='prepare': migration.prepare(data,output)
+elif mode=='apply': migration.apply(data,output,writers_stopped=True)
+else: migration.retire(data,output,writers_stopped=True)
+"""
+    result=subprocess.run([sys.executable,'-c',code,str(data),str(output),phase,mode],capture_output=True,text=True,env=os.environ)
+    assert result.returncode==73, result.stderr
+    journal=json.loads((output/'journal.json').read_text())
+    if journal['phase'] in ('prepared','writers_stopped','candidates_validated','state_installed'):
+        apply(data, output, writers_stopped=True)
+    assert retire(data, output, writers_stopped=True)['phase']=='logs_retired'
+    assert not (data/'migration_pending.json').exists()
+    assert (data/'retired-diagnostics/mqtt_server.log').stat().st_ino==inode
+    assert json.loads((data/'zone_ranges.json').read_text())=={'t:7':[1,2,3,4],'t:8':[1,2,3,4]}

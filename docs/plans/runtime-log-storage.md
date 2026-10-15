@@ -1,7 +1,7 @@
 # Bounded diagnostic logs and independent recovery state
 
-Status: implementation and isolated validation in progress; production migration
-and deployment have not started. Source baseline: `812f23d`. This is the owning implementation plan;
+Status: implemented and validated; controlled installation and log-free restart
+passed. The operator acceptance window and final legacy-log disposal remain pending. Source baseline: `812f23d`. This is the owning implementation plan;
 installation-specific measurements and maintenance details belong to the operator.
 
 ## Outcome and proposed defaults
@@ -41,22 +41,22 @@ content readers. Preserve runtime data-directory discovery when separating logs.
 
 ## L1 — Harden authoritative stores
 
-- [ ] Preserve current credential schema and zone key identity. Zone keys are
+- [x] Preserve current credential schema and zone key identity. Zone keys are
   currently `(tid, zid)`; do not silently introduce another identity scheme or
   assume those keys are globally unique across devices.
-- [ ] Stage candidate state under the existing store lock; use a private unique
+- [x] Stage candidate state under the existing store lock; use a private unique
   temporary file in the same directory, flush/fsync, atomic replace and directory
   fsync. Enforce intended ownership/modes and reject unexpected symlinks.
-- [ ] Publish in-memory state only after successful durable commit. Distinguish
+- [x] Publish in-memory state only after successful durable commit. Distinguish
   failure before replacement from uncertain durability after replacement; reconcile
   the latter without claiming success or overwriting newer state.
-- [ ] Distinguish absent, valid empty, complete, partial, corrupt, unsupported and
+- [x] Distinguish absent, valid empty, complete, partial, corrupt, unsupported and
   unreadable state. Existing invalid authoritative data must not silently reset.
-- [ ] Batch a zone exchange into one commit. Persist successful response-assigned
+- [x] Batch a zone exchange into one commit. Persist successful response-assigned
   IDs and coordinates for proxy and routine-runner paths, preserving existing
   acknowledgement/unknown-outcome semantics; never resend a command to repair a
   persistence failure.
-- [ ] Enforce one process owning a data directory, or implement and test genuine
+- [x] Enforce one process owning a data directory, or implement and test genuine
   cross-process consistency. Thread locks alone do not protect multiple servers.
 
 Acceptance: authenticated reconnect and non-actuating scene hydration work after
@@ -64,28 +64,28 @@ all diagnostic files are removed in an isolated fixture and the process restarts
 
 ## L2 — Explicit, bounded legacy migration
 
-- [ ] Provide a dry-run and separately explicit apply. Never construct production
+- [x] Provide a dry-run and separately explicit apply. Never construct production
   store objects during dry-run if constructors/methods can save.
-- [ ] Stream complete records chronologically with bounded record buffers and a
+- [x] Stream complete records chronologically with bounded record buffers and a
   bounded number of retained keys. Record source device/inode, fixed byte boundary,
   format version, counts and private fingerprints. Do not chase live EOF forever.
-- [ ] Preserve populated valid credentials. Recover only missing known identities;
+- [x] Preserve populated valid credentials. Recover only missing known identities;
   ambiguous identities/passwords, unsuccessful or incomplete CONNECT evidence
   require explicit reconciliation before acceptance.
-- [ ] Merge missing zone tuples using validated request/successful-response pairs,
+- [x] Merge missing zone tuples using validated request/successful-response pairs,
   including device-assigned IDs. Compare against every active scene's required
   `(tid, zid)`, not just a nonempty store or one coordinate per scene.
-- [ ] Preserve valid current coordinates over older history; report conflicting
+- [x] Preserve valid current coordinates over older history; report conflicting
   or unorderable evidence for reconciliation. Do not guess new coordinates.
-- [ ] Define strict numeric/schema validation, oversized/invalid UTF-8 records,
+- [x] Define strict numeric/schema validation, oversized/invalid UTF-8 records,
   malformed recovery-bearing entries, incomplete final records and unknown formats.
   Unresolved required state blocks destructive cleanup. A genuinely unused/empty
   zone set is acceptable only when observed scene references establish it.
-- [ ] Use a private recoverable journal with intended/result hashes and phases:
+- [x] Use a private recoverable journal with intended/result hashes and phases:
   `prepared → writers_stopped → candidates_validated → state_installed →
   logs_retired → service_verified → committed`. Multi-file installation is not
   atomic; unresolved partial installation must block normal startup.
-- [ ] Optional online preparation scans only through its captured boundary. At
+- [x] Optional online preparation scans only through its captured boundary. At
   cutover stop writers, verify source identity/prefix continuity, process the
   bounded final delta and revalidate against final state/scene references.
   Inode replacement, truncation or unexplained prefix changes invalidate preparation.
@@ -97,19 +97,19 @@ state, never by blindly repeating uncertain writes.
 
 ## L3 — Remove log dependencies and bound every writer
 
-- [ ] Remove normal startup credential backfill, startup zone seeding and runtime
+- [x] Remove normal startup credential backfill, startup zone seeding and runtime
   scene log fallback. Migration is an explicit compatibility tool, not an automatic
   request-time or every-startup scan.
-- [ ] Surface missing required state with an actionable diagnostic/readiness result;
+- [x] Surface missing required state with an actionable diagnostic/readiness result;
   do not dispatch scenes with unresolved geometry.
-- [ ] Implement the proposed eight-stream rotation policy, per-path writer registry,
+- [x] Implement the proposed eight-stream rotation policy, per-path writer registry,
   complete-record locking, size accounting, bounded archives and descriptor closure
   on shutdown/reconfiguration. Test the backend's actual module import aliases.
-- [ ] Handle preexisting oversized files only through migration/cutover. Do not
+- [x] Handle preexisting oversized files only through migration/cutover. Do not
   silently rotate an unmigrated recovery source out of existence on first start.
-- [ ] Bound record size and redact secrets at the producer. No concurrent external
+- [x] Bound record size and redact secrets at the producer. No concurrent external
   `copytruncate`, duplicate cleanup timer or global prune policy is introduced.
-- [ ] Make the byte/archive limits and diagnostic-error counters observable without
+- [x] Make the byte/archive limits and diagnostic-error counters observable without
   exposing payloads; update installation/backup guidance and configuration examples.
 
 Acceptance: tiny-threshold stress tests retain valid whole JSONL records, respect
@@ -117,20 +117,20 @@ bounds through restarts/concurrent writers and close superseded descriptors.
 
 ## L4 — Test the complete failure and recovery boundaries
 
-- [ ] Add persistence fault tests for partial writes, fsync/replace failure,
+- [x] Add persistence fault tests for partial writes, fsync/replace failure,
   disk-full/permission errors and process interruption at journal transitions.
-- [ ] Cover partial stores, repeated/newer zone updates, multiple zones per scene,
+- [x] Cover partial stores, repeated/newer zone updates, multiple zones per scene,
   response-assigned IDs, failed responses, conflicts, malformed/oversized records,
   append-after-boundary, source replacement and truncation.
-- [ ] Compare streaming reconstruction with independent expected synthetic results;
+- [x] Compare streaming reconstruction with independent expected synthetic results;
   measure bounded RSS against a generated large stream without a second huge file.
-- [ ] Test concurrent JSONL/text rotation, Unicode byte limits, exact thresholds,
+- [x] Test concurrent JSONL/text rotation, Unicode byte limits, exact thresholds,
   setup/reload/shutdown, log directory failure and second-process rejection.
-- [ ] Replace the old scene-log fallback test with explicit migration plus
+- [x] Replace the old scene-log fallback test with explicit migration plus
   log-free restart/hydration tests. Run the existing meaningful I/O, credential,
   MQTT proxy, admin API, routine runner, protocol-auth, runtime-state, supervisor
   and container-entrypoint suites, followed by the full isolated test suite.
-- [ ] Restore compact private state into an isolated instance with dummy peers
+- [x] Restore compact private state into an isolated instance with dummy peers
   and no production endpoints. Verify selected backup checksums/schema as well
   as application-level authentication and scene hydration without robot commands.
 
@@ -138,21 +138,21 @@ No fixture, network test or deployment check may actuate a physical vacuum.
 
 ## L5 — Controlled cutover, acceptance and space reclamation
 
-- [ ] Re-read the actual installation, source/image/config identities, active
+- [x] Re-read the actual installation, source/image/config identities, active
   clients, current robot/controller activity and available space. Keep local
   source changes and deployed credentials intact. Build one tested identified
   candidate in registered private outputs; record its footprint first.
-- [ ] Confirm no active cleaning using fresh state. Stop dependent controllers
+- [x] Confirm no active cleaning using fresh state. Stop dependent controllers
   first, then the server; verify all log writers have stopped. The operator owns
   the exact installation sequence. No pairing/reset/cloud import is required.
-- [ ] Capture compact consistent authoritative state, configuration, broker/session
+- [x] Capture compact consistent authoritative state, configuration, broker/session
   dependencies and the actual old image identity. Prove an isolated restore;
   a successful backup job alone is insufficient.
-- [ ] Complete and validate migration. Preserve original logs by same-filesystem
+- [x] Complete and validate migration. Preserve original logs by same-filesystem
   rename while stopped; start with fresh bounded logs. This provides temporary
   rollback without copying another entire legacy log set. Record exact private
   paths, owner and removal condition in the migration journal.
-- [ ] Start the new server, verify healthy endpoints, authenticated vacuum and
+- [x] Start the new server, verify healthy endpoints, authenticated vacuum and
   client reconnection, fresh state updates, retained identities/keys/sessions and
   complete non-actuating scene hydration. Then resume the dependent controller.
 - [ ] Observe a **24-hour proposed acceptance window** with no migration pending,
@@ -184,10 +184,30 @@ private installation documentation.
 
 ## Current validation evidence
 
-The bounded writer and explicit offline migration implementations have 22 targeted
-passing tests (2026-10-15), including whole-record concurrent rotation, import
-aliases, multi-token header redaction, required multi-zone coverage, failed-response
-exclusion, preservation of current coordinates, changed-source refusal, interrupted
-apply reconciliation and inode-preserving retirement. This does not yet establish
-full-suite, restore, installation or elapsed acceptance evidence. Migration blocks
-missing credentials rather than guessing authentication from CONNECT previews.
+Code baseline `9b82e3e` passed the complete 274-test isolated suite on 2026-10-15.
+Coverage includes concurrent byte-aware whole-record rotation and import aliases,
+actual MQTT credential aliases and multi-token header redaction, store write/fsync/
+replace failures, uncertain-publication reconciliation, strict schema and symlink
+rejection, process leases, assigned-ID recovery, every required scene tuple,
+changed-source refusal, interrupted apply reconciliation and inode-preserving
+retirement. A generated 128 MiB stream stayed below 64 MiB sampled child RSS;
+RSS is sampled during traversal rather than after materialization could be freed.
+
+The identified candidate preserves the previous runtime dependency versions.
+Compact consistent state passed isolated application-level authentication and
+non-actuating scene hydration with both the candidate and the exact prior image,
+without historical diagnostic files. The controlled installation repeated these
+checks and a successful restart with retired logs absent from active paths.
+Operator-specific identities, paths, counts and evidence remain in private records.
+
+Migration conservatively blocks missing credential material: historical CONNECT
+previews alone are insufficient authenticated identity evidence. It does not guess
+passwords or coordinates. Real subprocess abrupt-exit tests cover every product journal transition plus
+mid-credential installation and the first log rename; resume reconciles the
+actual files and preserves original inodes. Source replacement and truncation
+are tested separately from append-after-boundary.
+
+The 24-hour window has started but has not elapsed. The existing operator-owned
+maintenance schedule collects passive evidence and may remove only the explicitly
+retired allowlist after all acceptance/restore/rollback/time/identity gates pass.
+No physical cleaning acceptance and no reclaimed legacy-log space are claimed.

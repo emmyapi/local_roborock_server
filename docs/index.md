@@ -34,4 +34,4 @@ If you want to support this project, next time you buy a Roborock, use one of my
 
 ## Development plans
 
-- [Bounded diagnostics and independent recovery state](plans/runtime-log-storage.md) — implementation in progress; not installed.
+- [Bounded diagnostics and independent recovery state](plans/runtime-log-storage.md) — implemented and validated; elapsed acceptance and legacy disposal pending.
