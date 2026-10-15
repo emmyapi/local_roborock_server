@@ -181,3 +181,13 @@ print(n,peak)
     count, peak_kib = map(int, result.stdout.split())
     assert count == 131072
     assert peak_kib < 64 * 1024
+
+
+def test_numeric_assigned_tid_has_legacy_canonical_identity():
+    from roborock_local_server.legacy_migration import response_zones, zone_key
+    value = response()['decoded_messages'][0]['response_to']
+    value['result'][0]['tid'] = 123
+    assert response_zones(value) == {'123:7': [1, 2, 3, 4]}
+    for invalid in (True, 1.5, [], {}):
+        with pytest.raises(MigrationError):
+            zone_key(invalid, 7)

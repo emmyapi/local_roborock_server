@@ -24,8 +24,8 @@ if not hasattr(_state, "lock"):
     _state.writers = {}
     _state.errors = 0
 
-_SECRET = re.compile(r"password|passwd|token|secret|authorization|cookie|local_?key|signature|pin|credential", re.I)
-_TEXT_SECRET = re.compile(r"(?i)(\b(?:password|passwd|token|secret|authorization|cookie|local_?key|signature|pin)\b[\"']?\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,}]+)")
+_SECRET = re.compile(r"password|passwd|(?:device_)?mqtt_pass(?:wd|word)?|token|secret|authorization|cookie|local_?key|signature|pin|credential", re.I)
+_TEXT_SECRET = re.compile(r"(?i)(\b(?:password|passwd|(?:device_)?mqtt_pass(?:wd|word)?|token|secret|authorization|cookie|local_?key|signature|pin)\b[\"']?\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,}]+)")
 
 
 def _redact_text(text: str) -> str:

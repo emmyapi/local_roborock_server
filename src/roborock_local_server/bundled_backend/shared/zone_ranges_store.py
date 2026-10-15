@@ -38,6 +38,8 @@ def _parse_key(key: str) -> tuple[str, int] | None:
 
 
 def _validated_zone(tid: Any, zid: Any, coords: Any) -> tuple[str, list[int]]:
+    if type(tid) is int:
+        tid = str(tid)
     if (not isinstance(tid, str) or not tid.strip() or type(zid) is not int or zid < 0
             or not isinstance(coords, list) or len(coords) != 4
             or any(type(value) is not int for value in coords)):

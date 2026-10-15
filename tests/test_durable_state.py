@@ -195,3 +195,13 @@ def test_authority_byte_and_key_limits(tmp_path, monkeypatch):
     path.write_text('{"a":1,"b":2}')
     with pytest.raises(durable.PersistenceError): durable.load_json_object(path)
     with pytest.raises(durable.PersistenceError): durable.atomic_json(path, {"a":1,"b":2})
+
+
+def test_numeric_assigned_tid_preserves_legacy_identity(tmp_path):
+    from roborock_local_server.bundled_backend.shared.zone_ranges_store import ZoneRangesStore
+    store = ZoneRangesStore(tmp_path)
+    store.merge_set_scenes_zones_response(
+        {'data': [{'tid': 'temporary', 'zones': [{'range': [1, 2, 3, 4]}]}]},
+        [{'tid': 123, 'zones': [{'zid': 7}]}],
+    )
+    assert store.get('123', 7) == [1, 2, 3, 4]

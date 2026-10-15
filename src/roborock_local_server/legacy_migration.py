@@ -77,6 +77,8 @@ def coords(value: Any) -> list[int]:
 
 
 def zone_key(tid: Any, zid: Any) -> str:
+    if type(tid) is int:
+        tid = str(tid)
     if not isinstance(tid, str) or not tid.strip() or len(tid) > 256 or type(zid) is not int or zid < 0:
         raise MigrationError('invalid zone identity')
     return f'{tid}:{zid}'

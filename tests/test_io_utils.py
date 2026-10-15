@@ -143,3 +143,12 @@ def test_header_redaction_consumes_multitoken_values(tmp_path):
     for text in ('Authorization: Bearer PRIVATE_TOKEN', 'Cookie: first=PRIVATE_A; second=PRIVATE_B', 'authorization="Bearer PRIVATE_TOKEN"'):
         value = payload_preview(text.encode())
         assert 'PRIVATE' not in value
+
+
+def test_actual_mqtt_password_aliases_are_redacted(tmp_path):
+    from roborock_local_server.bundled_backend.shared.io_utils import payload_preview
+    path = tmp_path / 'aliases.jsonl'
+    append_jsonl(path, {'device_mqtt_pass': 'PRIVATE_A', 'mqtt_pass': 'PRIVATE_B', 'mqtt_passwd': 'PRIVATE_C'})
+    assert 'PRIVATE' not in path.read_text()
+    for text in ('device_mqtt_pass=PRIVATE_A', '"mqtt_pass":"PRIVATE_B"', 'mqtt_passwd=PRIVATE_C'):
+        assert 'PRIVATE' not in payload_preview(text.encode())
