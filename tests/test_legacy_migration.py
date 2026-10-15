@@ -134,3 +134,50 @@ def test_uncertain_write_can_resume_but_unexpected_state_blocks(tmp_path, monkey
     (data / 'zone_ranges.json').write_text('{"t:7":[99,99,100,100]}')
     with pytest.raises(MigrationError, match='unexpected authoritative'):
         apply(data, output, writers_stopped=True)
+
+
+@pytest.mark.parametrize('field,value', [('candidates', {'../outside': '0' * 64}), ('sources', {'../outside': {}}), ('retired_logs', [{'name': '../outside'}])])
+def test_corrupt_journal_never_selects_unlisted_paths(tmp_path, field, value):
+    data, output = fixture(tmp_path)
+    write_log(data, [response(7), response(8)])
+    prepare(data, output)
+    path = output / 'journal.json'
+    journal = json.loads(path.read_text())
+    journal[field] = value
+    path.write_text(json.dumps(journal))
+    with pytest.raises(MigrationError):
+        apply(data, output, writers_stopped=True)
+    assert not (data / 'migration_pending.json').exists()
+
+
+@pytest.mark.parametrize('action', [None, [], {'items': [None]}, {'items': [{'param': {'method': 'do_scenes_zones', 'params': []}}]}])
+def test_malformed_scene_schema_is_sanitized(tmp_path, action):
+    from roborock_local_server.legacy_migration import required_zones
+    with pytest.raises(MigrationError):
+        required_zones({'scenes': [{'param': {'action': action}}]})
+
+
+def test_large_stream_memory_is_bounded_by_record_not_history(tmp_path):
+    import os
+    import subprocess
+    import sys
+    path = tmp_path / 'large.jsonl'
+    line = json.dumps({'padding': 'x' * 1000}).encode() + b'\n'
+    with path.open('wb') as stream:
+        for _ in range(131072):
+            stream.write(line)
+    code = """from pathlib import Path
+import sys
+from roborock_local_server.legacy_migration import records
+p=Path(sys.argv[1]); n=0; peak=0
+for _ in records(p,p.stat().st_size):
+    n += 1
+    if n % 8192 == 0:
+        rss = next(int(line.split()[1]) for line in Path('/proc/self/status').read_text().splitlines() if line.startswith('VmRSS:'))
+        peak = max(peak, rss)
+print(n,peak)
+"""
+    result = subprocess.run([sys.executable, '-c', code, str(path)], capture_output=True, text=True, check=True, env=os.environ)
+    count, peak_kib = map(int, result.stdout.split())
+    assert count == 131072
+    assert peak_kib < 64 * 1024

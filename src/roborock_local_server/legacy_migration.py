@@ -8,6 +8,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import stat
 import tempfile
 from pathlib import Path
@@ -24,7 +25,10 @@ class MigrationError(RuntimeError):
 
 def digest(path: Path) -> str:
     h = hashlib.sha256()
-    with path.open('rb') as stream:
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, 'rb') as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise MigrationError('nonregular source refused')
         for part in iter(lambda: stream.read(1024 * 1024), b''):
             h.update(part)
     return h.hexdigest()
@@ -57,6 +61,8 @@ def read_json(path: Path, *, absent: Any = None) -> Any:
     if path.is_symlink():
         raise MigrationError('symlink source refused')
     try:
+        if path.stat().st_size > 64 * 1024 * 1024:
+            raise MigrationError('authoritative state exceeds supported bound')
         return json.loads(path.read_text(encoding='utf-8'))
     except FileNotFoundError:
         return absent
@@ -92,10 +98,15 @@ def required_zones(inventory: Any) -> tuple[set[str], dict[str, list[int]]]:
                 raise MigrationError('invalid scene payload') from exc
         if not isinstance(payload, dict):
             raise MigrationError('invalid scene payload')
-        items = payload.get('action', {}).get('items', [])
+        action = payload.get('action', {})
+        if not isinstance(action, dict):
+            raise MigrationError('invalid scene action')
+        items = action.get('items', [])
         if not isinstance(items, list):
             raise MigrationError('invalid scene actions')
         for item in items:
+            if not isinstance(item, dict):
+                raise MigrationError('invalid scene item')
             nested = item.get('param', {})
             if isinstance(nested, str):
                 try:
@@ -106,11 +117,18 @@ def required_zones(inventory: Any) -> tuple[set[str], dict[str, list[int]]]:
                 raise MigrationError('invalid scene command')
             if nested.get('method') != 'do_scenes_zones':
                 continue
-            entries = nested.get('params', {}).get('data')
+            params = nested.get('params')
+            if not isinstance(params, dict):
+                raise MigrationError('invalid scene parameters')
+            entries = params.get('data')
             if not isinstance(entries, list):
                 raise MigrationError('invalid zone scene')
             for entry in entries:
-                for zone in entry.get('zones', []):
+                if not isinstance(entry, dict) or not isinstance(entry.get('zones'), list):
+                    raise MigrationError('invalid scene zone entry')
+                for zone in entry['zones']:
+                    if not isinstance(zone, dict):
+                        raise MigrationError('invalid scene zone')
                     key = zone_key(entry.get('tid'), zone.get('zid'))
                     required.add(key)
                     if 'range' in zone:
@@ -143,7 +161,10 @@ def records(path: Path, boundary: int) -> Iterator[dict[str, Any]]:
 def response_zones(response: dict[str, Any]) -> dict[str, list[int]]:
     if response.get('error') is not None:
         return {}
-    requests = response.get('request_params', {}).get('data')
+    params = response.get('request_params')
+    if not isinstance(params, dict):
+        raise MigrationError('malformed recovery-bearing parameters')
+    requests = params.get('data')
     results = response.get('result')
     if not isinstance(requests, list) or not isinstance(results, list) or len(requests) != len(results):
         raise MigrationError('malformed recovery-bearing response')
@@ -155,6 +176,8 @@ def response_zones(response: dict[str, Any]) -> dict[str, list[int]]:
         if not isinstance(req_zones, list) or not isinstance(res_zones, list) or len(req_zones) != len(res_zones):
             raise MigrationError('incomplete zone response')
         for req_zone, res_zone in zip(req_zones, res_zones):
+            if not isinstance(req_zone, dict) or not isinstance(res_zone, dict):
+                raise MigrationError('malformed recovery-bearing zone')
             if 'range' not in req_zone:
                 continue
             key = zone_key(result.get('tid') or request.get('tid'), res_zone.get('zid', req_zone.get('zid')))
@@ -162,7 +185,7 @@ def response_zones(response: dict[str, Any]) -> dict[str, list[int]]:
     return found
 
 
-def prepare(data: Path, output: Path, *, audit: bool = False) -> dict[str, Any]:
+def _prepare(data: Path, output: Path, *, audit: bool = False) -> dict[str, Any]:
     output.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(output, 0o700)
     if (output / 'journal.json').exists():
@@ -187,6 +210,8 @@ def prepare(data: Path, output: Path, *, audit: bool = False) -> dict[str, Any]:
     if not isinstance(current, dict):
         raise MigrationError('invalid zone store')
     for key, value in current.items():
+        if not isinstance(key, str):
+            raise MigrationError('invalid zone key')
         tid, sep, zid = key.rpartition(':')
         if not sep or not zid.isdecimal() or zone_key(tid, int(zid)) != key:
             raise MigrationError('invalid zone key')
@@ -252,6 +277,8 @@ def prepare(data: Path, output: Path, *, audit: bool = False) -> dict[str, Any]:
             if (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns) != (final_stat.st_dev, final_stat.st_ino, final_stat.st_size, final_stat.st_mtime_ns):
                 raise MigrationError('source changed while fingerprinting')
             sources[path.name] = {'device': st.st_dev, 'inode': st.st_ino, 'bytes': st.st_size, 'sha256': fingerprint}
+            if path in initial_state:
+                sources[path.name]['payload_sha256'] = payload_digest(initial_state[path])
     for name, value in candidates.items():
         atomic_json(output / name, value)
     journal = {'version': VERSION, 'phase': 'prepared', 'data_directory': str(data.resolve()), 'sources': sources, 'candidates': {name: digest(output / name) for name in candidates}, 'counts': {'records': count, 'devices': len(devices), 'required_zones': len(required), 'zones': len(merged)}, 'retired_logs': []}
@@ -259,13 +286,44 @@ def prepare(data: Path, output: Path, *, audit: bool = False) -> dict[str, Any]:
     return journal
 
 
-def apply(data: Path, output: Path, *, writers_stopped: bool) -> dict[str, Any]:
-    if not writers_stopped:
-        raise MigrationError('apply requires explicit --writers-stopped acknowledgement')
+def payload_digest(value: Any) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=True, separators=(',', ':')).encode()).hexdigest()
+
+
+def validated_journal(data: Path, output: Path) -> dict[str, Any]:
     journal = read_json(output / 'journal.json')
     if not isinstance(journal, dict) or journal.get('version') != VERSION or journal.get('data_directory') != str(data.resolve()):
         raise MigrationError('journal identity mismatch')
-    if journal['phase'] not in ('prepared', 'writers_stopped', 'candidates_validated', 'state_installed'):
+    candidates = journal.get('candidates')
+    sources = journal.get('sources')
+    if not isinstance(candidates, dict) or set(candidates) != {'runtime_credentials.json', 'zone_ranges.json'}:
+        raise MigrationError('journal candidate allowlist mismatch')
+    if not isinstance(sources, dict) or not {'runtime_credentials.json', 'web_api_inventory.json', 'decompiled_mqtt.jsonl'} <= set(sources) <= {'runtime_credentials.json', 'web_api_inventory.json', 'decompiled_mqtt.jsonl', 'zone_ranges.json'}:
+        raise MigrationError('journal source allowlist mismatch')
+    for value in candidates.values():
+        if not isinstance(value, str) or re.fullmatch('[0-9a-f]{64}', value) is None:
+            raise MigrationError('invalid journal fingerprint')
+    for name, source in sources.items():
+        if not isinstance(source, dict) or any(type(source.get(k)) is not int or source[k] < 0 for k in ('device', 'inode', 'bytes')):
+            raise MigrationError('invalid source identity')
+        for field in ('sha256',) if name == 'decompiled_mqtt.jsonl' else ('sha256', 'payload_sha256'):
+            if not isinstance(source.get(field), str) or re.fullmatch('[0-9a-f]{64}', source[field]) is None:
+                raise MigrationError('invalid source fingerprint')
+    if not isinstance(journal.get('counts'), dict) or not isinstance(journal.get('retired_logs'), list):
+        raise MigrationError('invalid journal metadata')
+    seen = set()
+    for item in journal['retired_logs']:
+        if not isinstance(item, dict) or item.get('name') not in LOG_NAMES or item['name'] in seen or any(type(item.get(k)) is not int or item[k] < 0 for k in ('device', 'inode', 'bytes')):
+            raise MigrationError('invalid retired diagnostic identity')
+        seen.add(item['name'])
+    return journal
+
+
+def _apply(data: Path, output: Path, *, writers_stopped: bool) -> dict[str, Any]:
+    if not writers_stopped:
+        raise MigrationError('apply requires explicit --writers-stopped acknowledgement')
+    journal = validated_journal(data, output)
+    if journal.get('phase') not in ('prepared', 'writers_stopped', 'candidates_validated', 'state_installed'):
         raise MigrationError('journal phase requires operator reconciliation')
     # Resume only if every actual state is exactly the recorded original or candidate.
     for name, source in journal['sources'].items():
@@ -290,8 +348,13 @@ def apply(data: Path, output: Path, *, writers_stopped: bool) -> dict[str, Any]:
     for name in journal['candidates']:
         original = data / name
         backup = output / ('original-' + name)
-        if original.exists() and not backup.exists() and digest(original) != journal['candidates'][name]:
+        if backup.exists():
+            if payload_digest(read_json(backup)) != journal['sources'].get(name, {}).get('payload_sha256'):
+                raise MigrationError('original backup fingerprint mismatch')
+        elif original.exists() and digest(original) != journal['candidates'][name]:
             atomic_json(backup, read_json(original))
+            if payload_digest(read_json(backup)) != journal['sources'][name]['payload_sha256']:
+                raise MigrationError('original backup fingerprint mismatch')
         atomic_json(original, read_json(output / name))
     journal['phase'] = 'state_installed'
     atomic_json(output / 'journal.json', journal)
@@ -302,12 +365,12 @@ LOG_NAMES = ('api_server.log', 'iot_server.log', 'wood_server.log', 'https_serve
              'mqtt_server.log', 'unknown_server.log', 'decompiled_http.jsonl', 'decompiled_mqtt.jsonl')
 
 
-def retire(data: Path, output: Path, *, writers_stopped: bool) -> dict[str, Any]:
+def _retire(data: Path, output: Path, *, writers_stopped: bool) -> dict[str, Any]:
     """Rename the exact legacy allowlist on the same filesystem; never delete."""
     if not writers_stopped:
         raise MigrationError('retirement requires stopped writers')
-    journal = read_json(output / 'journal.json')
-    if not isinstance(journal, dict) or journal.get('phase') not in ('state_installed', 'logs_retiring', 'logs_retired') or journal.get('data_directory') != str(data.resolve()):
+    journal = validated_journal(data, output)
+    if journal.get('phase') not in ('state_installed', 'logs_retiring', 'logs_retired') or journal.get('data_directory') != str(data.resolve()):
         raise MigrationError('retirement journal identity or phase mismatch')
     for name, expected in journal['candidates'].items():
         if digest(data / name) != expected:
@@ -362,6 +425,29 @@ def retire(data: Path, output: Path, *, writers_stopped: bool) -> dict[str, Any]
     finally:
         os.close(fd)
     return journal
+
+
+def _leased(operation, data: Path, output: Path, **kwargs):
+    from roborock_local_server.bundled_backend.shared.durable_state import RuntimeDirectoryLease, PersistenceError
+    try:
+        with RuntimeDirectoryLease(data, allow_migration_pending=operation is not _prepare):
+            return operation(data, output, **kwargs)
+    except PersistenceError as exc:
+        raise MigrationError('runtime directory is active or pending; reconcile before migration') from exc
+
+
+def prepare(data: Path, output: Path, *, audit: bool = False) -> dict[str, Any]:
+    if audit:
+        return _prepare(data, output, audit=True)
+    return _leased(_prepare, data, output)
+
+
+def apply(data: Path, output: Path, *, writers_stopped: bool) -> dict[str, Any]:
+    return _leased(_apply, data, output, writers_stopped=writers_stopped)
+
+
+def retire(data: Path, output: Path, *, writers_stopped: bool) -> dict[str, Any]:
+    return _leased(_retire, data, output, writers_stopped=writers_stopped)
 
 
 def main() -> None:

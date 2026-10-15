@@ -1,7 +1,7 @@
 # Bounded diagnostic logs and independent recovery state
 
-Status: investigated and proposed; implementation, migration and deployment have
-not started. Source baseline: `812f23d`. This is the owning implementation plan;
+Status: implementation and isolated validation in progress; production migration
+and deployment have not started. Source baseline: `812f23d`. This is the owning implementation plan;
 installation-specific measurements and maintenance details belong to the operator.
 
 ## Outcome and proposed defaults
@@ -181,3 +181,13 @@ installation, physical acceptance or reclaimed space. Those are recorded here as
 L1–L5 are actually completed. Code and generic migration behavior belong in this
 repository; operator-specific measurements, access and cutover details stay in
 private installation documentation.
+
+## Current validation evidence
+
+The bounded writer and explicit offline migration implementations have 22 targeted
+passing tests (2026-10-15), including whole-record concurrent rotation, import
+aliases, multi-token header redaction, required multi-zone coverage, failed-response
+exclusion, preservation of current coordinates, changed-source refusal, interrupted
+apply reconciliation and inode-preserving retirement. This does not yet establish
+full-suite, restore, installation or elapsed acceptance evidence. Migration blocks
+missing credentials rather than guessing authentication from CONNECT previews.

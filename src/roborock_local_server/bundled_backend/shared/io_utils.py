@@ -42,7 +42,7 @@ def _redact(value: Any, depth: int = 0) -> Any:
     if depth > 20:
         return "[depth limited]"
     if isinstance(value, dict):
-        return {str(k): "[REDACTED]" if _SECRET.search(str(k)) or str(k) in {"payload_hex", "payload_preview", "payload_utf8"} else _redact(v, depth + 1) for k, v in value.items()}
+        return {str(k): (v if isinstance(v, str) and v in {"<redacted>", "[REDACTED]"} else "[REDACTED]") if _SECRET.search(str(k)) or str(k) in {"payload_hex", "payload_preview", "payload_utf8"} else _redact(v, depth + 1) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
         return [_redact(v, depth + 1) for v in value]
     return _redact_text(value) if isinstance(value, str) else value

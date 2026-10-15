@@ -28,6 +28,10 @@ If you want to support this project, next time you buy a Roborock, use one of my
 - [Custom certificate management](custom_cert_management.md)
 - [Technical Writeup](technical_writeup.md)
 
+## Operations
+
+- [Runtime state, bounded diagnostics and explicit legacy migration](runtime-storage.md)
+
 ## Development plans
 
-- [Bounded diagnostics and independent recovery state](plans/runtime-log-storage.md) — proposed; not installed.
+- [Bounded diagnostics and independent recovery state](plans/runtime-log-storage.md) — implementation in progress; not installed.
