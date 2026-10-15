@@ -27,3 +27,7 @@ If you want to support this project, next time you buy a Roborock, use one of my
 - [Custom MQTT](custom_mqtt.md)
 - [Custom certificate management](custom_cert_management.md)
 - [Technical Writeup](technical_writeup.md)
+
+## Development plans
+
+- [Bounded diagnostics and independent recovery state](plans/runtime-log-storage.md) — proposed; not installed.
